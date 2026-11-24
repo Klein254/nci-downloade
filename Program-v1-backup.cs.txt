@@ -1,0 +1,2873 @@
+// TCIA DICOM Downloader
+// Search the public collections of The Cancer Imaging Archive (TCIA) and download
+// DICOM series straight into a folder (by default Downloads\TCIA).
+// Built with the C# compiler that ships with Windows (.NET Framework 4.8), so it needs nothing installed.
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Globalization;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+using System.Windows.Forms;
+
+[assembly: AssemblyTitle("TCIA DICOM Downloader")]
+[assembly: AssemblyProduct("TCIA DICOM Downloader")]
+[assembly: AssemblyDescription("Search and download DICOM data from The Cancer Imaging Archive")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
+
+namespace TciaDownloader
+{
+    static class Program
+    {
+        [STAThread]
+        static int Main(string[] args)
+        {
+            try { ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)12288; }
+            catch (NotSupportedException) { ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12; }
+            ServicePointManager.DefaultConnectionLimit = 24;
+
+            if (args.Length >= 2 && args[0] == "--write-icon")
+            {
+                File.WriteAllBytes(args[1], AppIcon.BuildIco(new int[] { 16, 20, 24, 32, 40, 48, 64, 128, 256 }));
+                return 0;
+            }
+            if (args.Length >= 2 && args[0] == "--selftest")
+                return SelfTest.Run(args[1]).GetAwaiter().GetResult();
+
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.ThreadException += (s, e) =>
+                MessageBox.Show("Something went wrong:\n\n" + e.Exception.Message, "TCIA Downloader",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Application.Run(new MainForm(args));
+            return 0;
+        }
+    }
+
+    // ------------------------------------------------------------------ data
+
+    enum QState { Pending, Active, Done, Skipped, Failed, Canceled }
+
+    class CollectionInfo
+    {
+        public string Name = "", Title = "", CancerTypes = "", Locations = "", Subjects = "", Species = "", Link = "", Abstract = "", Doi = "";
+        public List<string> Modalities = new List<string>();
+        public bool ModalitiesLoaded;
+        string[] words = new string[0];
+        string nameLower = "";
+
+        public string TypeText { get { return CancerTypes != "" ? CancerTypes : Locations; } }
+        public string ModText { get { return ModalitiesLoaded ? string.Join(", ", Modalities) : "…"; } }
+        public int SubjectsNum { get { int n; return int.TryParse(Subjects.Replace(",", "").Trim(), out n) ? n : -1; } }
+        public string SubjectsText { get { int n = SubjectsNum; return n >= 0 ? n.ToString("N0") : Subjects; } }
+
+        public void UpdateSearch()
+        {
+            string all = Name + " " + Title + " " + CancerTypes + " " + Locations + " " + Species + " " + string.Join(" ", Modalities);
+            words = Regex.Split(all.ToLowerInvariant(), "[^a-z0-9]+").Where(w => w != "").Distinct().ToArray();
+            nameLower = Name.ToLowerInvariant();
+        }
+
+        public bool Matches(string[] terms, string raw)
+        {
+            if (raw != "" && nameLower.Contains(raw)) return true;
+            foreach (var t in terms)
+            {
+                bool ok = false;
+                foreach (var w in words) if (w.StartsWith(t, StringComparison.Ordinal)) { ok = true; break; }
+                if (!ok) return false;
+            }
+            return true;
+        }
+    }
+
+    class SeriesInfo
+    {
+        public string SeriesUID = "", StudyUID = "", Collection = "", PatientID = "", Modality = "", SeriesDesc = "",
+            StudyDesc = "", StudyDate = "", SeriesDate = "", BodyPart = "", SeriesNumber = "";
+        public int ImageCount;
+        public long FileSize;
+
+        public static SeriesInfo From(Dictionary<string, object> d)
+        {
+            var s = new SeriesInfo();
+            s.SeriesUID = J.S(d, "SeriesInstanceUID");
+            s.StudyUID = J.S(d, "StudyInstanceUID");
+            s.Collection = J.S(d, "Collection");
+            s.PatientID = J.S(d, "PatientID");
+            s.Modality = J.S(d, "Modality");
+            s.SeriesDesc = J.S(d, "SeriesDescription");
+            if (s.SeriesDesc == "") s.SeriesDesc = J.S(d, "ProtocolName");
+            s.StudyDesc = J.S(d, "StudyDesc");
+            if (s.StudyDesc == "") s.StudyDesc = J.S(d, "StudyDescription");
+            s.StudyDate = Util.DateOnly(J.S(d, "StudyDate"));
+            s.SeriesDate = Util.DateOnly(J.S(d, "SeriesDate"));
+            s.BodyPart = J.S(d, "BodyPartExamined");
+            s.SeriesNumber = Util.CleanNumber(J.S(d, "SeriesNumber"));
+            s.ImageCount = (int)J.L(d, "ImageCount");
+            s.FileSize = J.L(d, "FileSize");
+            return s;
+        }
+
+        public static int Compare(SeriesInfo a, SeriesInfo b)
+        {
+            int r = string.CompareOrdinal(a.StudyDate, b.StudyDate); if (r != 0) return r;
+            r = string.CompareOrdinal(a.StudyUID, b.StudyUID); if (r != 0) return r;
+            double x, y;
+            bool hx = double.TryParse(a.SeriesNumber, NumberStyles.Float, CultureInfo.InvariantCulture, out x);
+            bool hy = double.TryParse(b.SeriesNumber, NumberStyles.Float, CultureInfo.InvariantCulture, out y);
+            if (hx && hy && x != y) return x.CompareTo(y);
+            if (hx != hy) return hx ? -1 : 1;
+            return string.CompareOrdinal(a.Modality + a.SeriesDesc, b.Modality + b.SeriesDesc);
+        }
+    }
+
+    class QueueItem
+    {
+        public SeriesInfo S;
+        public string Root, Folder, CollectionDir;
+        public volatile QState State;
+        public volatile string Status = "Waiting";
+        public long Received;
+        public long ZipBytes;
+        public int Files;
+        public CancellationTokenSource Cts;
+        public ListViewItem Item;
+        public string Shown = "";
+        public bool Seen;
+    }
+
+    class ModItem
+    {
+        public string Code, Label; public int Count;
+        public ModItem(string code, string label, int count) { Code = code; Label = label; Count = count; }
+        public override string ToString()
+        {
+            return Count > 0 ? Label + "   · " + Count + (Count == 1 ? " collection" : " collections") : Label;
+        }
+    }
+
+    class PermanentException : Exception { public PermanentException(string m) : base(m) { } }
+
+    // ------------------------------------------------------------------ JSON helpers
+
+    static class J
+    {
+        public static string S(Dictionary<string, object> d, string k)
+        {
+            object v;
+            if (d == null || !d.TryGetValue(k, out v) || v == null) return "";
+            if (v is string) return ((string)v).Trim();
+            var dict = v as Dictionary<string, object>;
+            if (dict != null) return S(dict, "rendered");
+            if (v is IEnumerable)
+            {
+                var parts = new List<string>();
+                foreach (var o in (IEnumerable)v)
+                {
+                    if (o == null) continue;
+                    string s = WebUtility.HtmlDecode(Convert.ToString(o, CultureInfo.InvariantCulture)).Trim();
+                    if (s != "" && !parts.Contains(s)) parts.Add(s);
+                }
+                return string.Join(", ", parts);
+            }
+            return Convert.ToString(v, CultureInfo.InvariantCulture);
+        }
+
+        public static long L(Dictionary<string, object> d, string k)
+        {
+            double x;
+            return double.TryParse(S(d, k), NumberStyles.Float, CultureInfo.InvariantCulture, out x) ? (long)x : 0;
+        }
+
+        public static List<Dictionary<string, object>> ParseList(string s)
+        {
+            var list = new List<Dictionary<string, object>>();
+            if (string.IsNullOrWhiteSpace(s)) return list;
+            s = s.Trim();
+            if (!s.StartsWith("[") && !s.StartsWith("{")) return list;
+            var ser = new JavaScriptSerializer();
+            ser.MaxJsonLength = int.MaxValue;
+            ser.RecursionLimit = 256;
+            object o = ser.DeserializeObject(s);
+            var one = o as Dictionary<string, object>;
+            if (one != null) { list.Add(one); return list; }
+            var arr = o as IEnumerable;
+            if (arr != null)
+                foreach (var x in arr) { var d = x as Dictionary<string, object>; if (d != null) list.Add(d); }
+            return list;
+        }
+    }
+
+    // ------------------------------------------------------------------ TCIA web services
+
+    static class Tcia
+    {
+        public const string Base = "https://services.cancerimagingarchive.net/nbia-api/services/v1/";
+        public const string Web = "https://www.cancerimagingarchive.net/api/v1/collections/";
+        static readonly HttpClient http;
+
+        static Tcia()
+        {
+            var h = new HttpClientHandler();
+            h.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
+            http = new HttpClient(h);
+            http.Timeout = Timeout.InfiniteTimeSpan;
+            http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TCIA-Downloader/1.0");
+        }
+
+        public static HttpClient Http { get { return http; } }
+
+        public static async Task<string> GetString(string url, CancellationToken ct, int timeoutSec)
+        {
+            for (int attempt = 1; ; attempt++)
+            {
+                string err = null;
+                bool retry = true;
+                using (var cts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                {
+                    cts.CancelAfter(TimeSpan.FromSeconds(timeoutSec));
+                    try
+                    {
+                        using (var resp = await http.GetAsync(url, cts.Token))
+                        {
+                            if (resp.IsSuccessStatusCode) return await resp.Content.ReadAsStringAsync();
+                            int code = (int)resp.StatusCode;
+                            err = "the server answered " + code + " " + resp.ReasonPhrase;
+                            retry = code >= 500 || code == 429;
+                        }
+                    }
+                    catch (OperationCanceledException) { if (ct.IsCancellationRequested) throw; err = "the request timed out"; }
+                    catch (HttpRequestException ex) { err = Util.Inner(ex); }
+                }
+                if (!retry || attempt >= 3) throw new HttpRequestException(err);
+                await Task.Delay(1000 * attempt, ct);
+            }
+        }
+
+        public static async Task<List<Dictionary<string, object>>> GetList(string pathAndQuery, CancellationToken ct)
+        {
+            return J.ParseList(await GetString(Base + pathAndQuery, ct, 120));
+        }
+
+        // Collection descriptions (cancer type, site, subjects, abstract) from the TCIA website.
+        public static async Task<List<Dictionary<string, object>>> GetWebCollections(CancellationToken ct)
+        {
+            const string fields = "slug,link,title,cancer_types,cancer_locations,subjects,collection_title,collection_short_title,species,collection_doi," +
+                "collection_abstract,collection_summary,collection_introduction";
+            Func<int, string> url = p => Web + "?per_page=100&page=" + p + "&_fields=" + fields;
+            var all = new List<Dictionary<string, object>>();
+            int pages = 5;
+            using (var cts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                cts.CancelAfter(TimeSpan.FromSeconds(90));
+                using (var resp = await http.GetAsync(url(1), cts.Token))
+                {
+                    resp.EnsureSuccessStatusCode();
+                    IEnumerable<string> vals;
+                    int n;
+                    if (resp.Headers.TryGetValues("X-WP-TotalPages", out vals) && int.TryParse(vals.FirstOrDefault(), out n)) pages = n;
+                    all.AddRange(J.ParseList(await resp.Content.ReadAsStringAsync()));
+                }
+            }
+            if (pages > 1)
+            {
+                var tasks = Enumerable.Range(2, Math.Min(pages, 30) - 1).Select(p => GetString(url(p), ct, 90)).ToList();
+                foreach (var t in tasks)
+                {
+                    try { all.AddRange(J.ParseList(await t)); }
+                    catch (HttpRequestException) { }
+                }
+            }
+            return all;
+        }
+    }
+
+    // ------------------------------------------------------------------ downloading
+
+    static class Downloader
+    {
+        public static long TotalReceived;
+        public static double ZipRatio = 0.62;   // learned: zip bytes / uncompressed bytes
+        static int ratioSamples;
+        static readonly object ratioLock = new object();
+        public const string StDownloading = "Downloading";
+        public const string StUnpacking = "Unpacking…";
+        static readonly TimeSpan Stall = TimeSpan.FromSeconds(120);
+
+        public static string CollectionDir(string root, SeriesInfo s)
+        {
+            return Path.Combine(root, Util.Clean(s.Collection, 48, "Unknown collection"));
+        }
+
+        // <root>\<Collection>\<Patient>\<StudyDate StudyDesc (uid)>\<No Modality SeriesDesc (uid)>\1-001.dcm
+        public static string SeriesFolder(string root, SeriesInfo s)
+        {
+            string coll = CollectionDir(root, s);
+            string pat = Util.Clean(s.PatientID, 48, "Unknown patient");
+            string study = Util.Clean(Util.JoinNonEmpty(" ", s.StudyDate, s.StudyDesc), 40, "Study") + " (" + Util.Tail(s.StudyUID, 5) + ")";
+            string ser = Util.Clean(Util.JoinNonEmpty(" ", s.SeriesNumber, s.Modality, s.SeriesDesc), 44, "Series") + " (" + Util.Tail(s.SeriesUID, 5) + ")";
+            string p = Path.Combine(coll, pat, study, ser);
+            if (p.Length > 205)
+            {
+                study = Util.Clean(s.StudyDate, 12, "Study") + " (" + Util.Tail(s.StudyUID, 5) + ")";
+                ser = Util.Clean(Util.JoinNonEmpty(" ", s.SeriesNumber, s.Modality), 16, "Series") + " (" + Util.Tail(s.SeriesUID, 5) + ")";
+                p = Path.Combine(coll, pat, study, ser);
+            }
+            return p;
+        }
+
+        public static async Task DownloadOne(QueueItem q, CancellationToken ct)
+        {
+            SeriesInfo s = q.S;
+            if (Util.IsComplete(q.Folder, s.ImageCount))
+            {
+                q.Status = "Already on your computer";
+                q.State = QState.Skipped;
+                return;
+            }
+
+            string partial = Path.Combine(q.Root, ".partial");
+            Directory.CreateDirectory(partial);
+            try { File.SetAttributes(partial, File.GetAttributes(partial) | FileAttributes.Hidden); } catch (IOException) { }
+
+            try
+            {
+                var drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(q.Root)));
+                if (s.FileSize > 0 && drive.AvailableFreeSpace < s.FileSize * 2 + 200L * 1024 * 1024)
+                    throw new PermanentException("Not enough free disk space on " + drive.Name);
+            }
+            catch (ArgumentException) { }
+
+            string zipPath = Path.Combine(partial, Util.Clean(s.SeriesUID, 80, "series") + ".zip");
+            string url = Tcia.Base + "getImage?NewFileNames=Yes&SeriesInstanceUID=" + Uri.EscapeDataString(s.SeriesUID);
+            const int MaxAttempts = 4;
+            for (int attempt = 1; ; attempt++)
+            {
+                ct.ThrowIfCancellationRequested();
+                Interlocked.Exchange(ref q.Received, 0);
+                q.Status = attempt == 1 ? "Connecting…" : "Retrying (" + attempt + " of " + MaxAttempts + ")…";
+                string err = null;
+                try { await FetchToFile(url, zipPath, q, ct); }
+                catch (OperationCanceledException) { if (ct.IsCancellationRequested) throw; err = "the connection stalled"; }
+                catch (HttpRequestException ex) { if (ct.IsCancellationRequested) throw new OperationCanceledException(ct); err = Util.Inner(ex); }
+                catch (IOException ex) { if (ct.IsCancellationRequested) throw new OperationCanceledException(ct); err = ex.Message; }
+                catch (WebException ex) { if (ct.IsCancellationRequested) throw new OperationCanceledException(ct); err = ex.Message; }
+                catch (ObjectDisposedException) { if (ct.IsCancellationRequested) throw new OperationCanceledException(ct); err = "the connection stalled"; }
+                if (err == null) break;
+                Util.TryDelete(zipPath);
+                if (attempt >= MaxAttempts) throw new IOException("Download failed: " + err);
+                await Task.Delay(TimeSpan.FromSeconds(3 * attempt), ct);
+            }
+
+            q.ZipBytes = new FileInfo(zipPath).Length;
+            if (q.ZipBytes < 22)
+            {
+                Util.TryDelete(zipPath);
+                throw new PermanentException("TCIA sent no data for this series (it may be limited-access)");
+            }
+
+            q.Status = StUnpacking;
+            string tmp = q.Folder + ".part";
+            int files = 0;
+            try
+            {
+                Util.TryDeleteDir(tmp);
+                Directory.CreateDirectory(tmp);
+                using (var za = ZipFile.OpenRead(zipPath))
+                {
+                    foreach (var e in za.Entries)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        string name = Path.GetFileName(e.FullName.Replace('/', '\\'));
+                        if (string.IsNullOrEmpty(name)) continue;
+                        if (name.Equals("LICENSE", StringComparison.OrdinalIgnoreCase) || name.StartsWith("LICENSE.", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string lic = Path.Combine(q.CollectionDir, "LICENSE.txt");
+                            try { if (!File.Exists(lic)) e.ExtractToFile(lic, false); } catch (IOException) { }
+                            continue;
+                        }
+                        e.ExtractToFile(Path.Combine(tmp, name), true);
+                        files++;
+                    }
+                }
+                if (files == 0) throw new PermanentException("The download contained no DICOM files");
+                Util.TryDeleteDir(q.Folder);
+                Directory.Move(tmp, q.Folder);
+            }
+            catch (InvalidDataException)
+            {
+                Util.TryDeleteDir(tmp);
+                throw new IOException("The downloaded file was damaged - please retry");
+            }
+            catch
+            {
+                Util.TryDeleteDir(tmp);
+                throw;
+            }
+            finally
+            {
+                Util.TryDelete(zipPath);
+            }
+
+            if (s.FileSize > 0)
+            {
+                double r = (double)q.ZipBytes / s.FileSize;
+                lock (ratioLock)
+                {
+                    if (r > 0.05 && r < 1.5)
+                    {
+                        ZipRatio = (ZipRatio * (ratioSamples + 1) + r) / (ratioSamples + 2);
+                        ratioSamples = Math.Min(ratioSamples + 1, 20);
+                    }
+                }
+            }
+            q.Files = files;
+            q.Status = "Done · " + files.ToString("N0") + (files == 1 ? " file" : " files");
+            q.State = QState.Done;
+        }
+
+        static async Task FetchToFile(string url, string path, QueueItem q, CancellationToken ct)
+        {
+            using (var stall = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                stall.CancelAfter(Stall);
+                using (var resp = await Tcia.Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, stall.Token))
+                using (stall.Token.Register(() => { try { resp.Dispose(); } catch (Exception) { } }))
+                {
+                    int code = (int)resp.StatusCode;
+                    if (code >= 400 && code < 500 && code != 408 && code != 429)
+                        throw new PermanentException("TCIA refused this series (" + code + "); it may be limited-access");
+                    if (!resp.IsSuccessStatusCode) throw new HttpRequestException("the server answered " + code + " " + resp.ReasonPhrase);
+                    q.Status = StDownloading;
+                    using (var src = await resp.Content.ReadAsStreamAsync())
+                    using (var dst = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16, true))
+                    {
+                        var buf = new byte[1 << 17];
+                        while (true)
+                        {
+                            int n = await src.ReadAsync(buf, 0, buf.Length, stall.Token);
+                            if (n <= 0) break;
+                            await dst.WriteAsync(buf, 0, n);
+                            Interlocked.Add(ref q.Received, n);
+                            Interlocked.Add(ref TotalReceived, n);
+                            stall.CancelAfter(Stall);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ utilities
+
+    static class Util
+    {
+        static readonly char[] Bad = Path.GetInvalidFileNameChars();
+        static readonly HashSet<string> Reserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9" };
+        static readonly string[] ModOrder = { "CT", "MR", "PT", "NM", "CR", "DX", "MG", "US", "XA", "RF", "RTSTRUCT", "RTPLAN", "RTDOSE", "RTIMAGE", "RTRECORD", "SEG", "REG", "SR", "PR", "KO", "SM", "OT" };
+
+        public static string Clean(string s, int max, string fallback)
+        {
+            var sb = new StringBuilder();
+            foreach (char ch in (s ?? "")) sb.Append(Array.IndexOf(Bad, ch) >= 0 || char.IsControl(ch) ? '_' : ch);
+            string r = Regex.Replace(sb.ToString(), @"\s+", " ").Trim().Trim('.', ' ');
+            if (r.Length > max) r = r.Substring(0, max).Trim().Trim('.', ' ');
+            if (r == "") r = fallback;
+            if (Reserved.Contains(r)) r = "_" + r;
+            return r;
+        }
+
+        public static string Tail(string s, int n) { s = s ?? ""; return s.Length <= n ? s : s.Substring(s.Length - n); }
+
+        public static string JoinNonEmpty(string sep, params string[] parts)
+        {
+            return string.Join(sep, parts.Where(p => !string.IsNullOrWhiteSpace(p)).Select(p => p.Trim()));
+        }
+
+        public static string Inner(Exception ex)
+        {
+            while (ex.InnerException != null) ex = ex.InnerException;
+            return ex.Message;
+        }
+
+        public static string DateOnly(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var m = Regex.Match(s, @"^\d{4}-\d{2}-\d{2}");
+            if (m.Success) return m.Value;
+            m = Regex.Match(s, @"^(\d{2})-(\d{2})-(\d{4})");
+            if (m.Success) return m.Groups[3].Value + "-" + m.Groups[1].Value + "-" + m.Groups[2].Value;
+            return s.Length > 10 ? s.Substring(0, 10) : s;
+        }
+
+        public static string CleanNumber(string s)
+        {
+            double d;
+            if (double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out d) && Math.Abs(d - Math.Round(d)) < 1e-9)
+                return ((long)Math.Round(d)).ToString(CultureInfo.InvariantCulture);
+            return s ?? "";
+        }
+
+        public static string Size(long b)
+        {
+            if (b <= 0) return "";
+            string[] u = { "B", "KB", "MB", "GB", "TB" };
+            double v = b; int i = 0;
+            while (v >= 1024 && i < u.Length - 1) { v /= 1024; i++; }
+            string num = i == 0 ? v.ToString("0") : v < 10 ? v.ToString("0.0") : v.ToString("0");
+            return num + " " + u[i];
+        }
+
+        public static string Duration(double sec)
+        {
+            if (double.IsNaN(sec) || double.IsInfinity(sec) || sec < 0) return "";
+            if (sec < 60) return "less than a minute";
+            if (sec < 3600) return (int)Math.Ceiling(sec / 60) + " min";
+            double h = sec / 3600;
+            return h < 10 ? h.ToString("0.0") + " hours" : (int)h + " hours";
+        }
+
+        public static string ShortPath(string p, int max)
+        {
+            if (p == null || p.Length <= max) return p;
+            string root = Path.GetPathRoot(p) ?? "";
+            var parts = p.Substring(root.Length).TrimEnd('\\').Split('\\');
+            string tail = parts[parts.Length - 1];
+            for (int i = parts.Length - 2; i >= 0; i--)
+            {
+                string cand = parts[i] + "\\" + tail;
+                if (root.Length + 2 + cand.Length > max) break;
+                tail = cand;
+            }
+            return root + "…\\" + tail;
+        }
+
+        public static string SeriesLabel(SeriesInfo s) { return s.SeriesDesc != "" ? s.SeriesDesc : "(no description)"; }
+
+        public static string Norm(string s) { return Regex.Replace((s ?? "").ToLowerInvariant(), "[^a-z0-9]", ""); }
+
+        public static string StripHtml(string html)
+        {
+            if (string.IsNullOrEmpty(html)) return "";
+            string s = Regex.Replace(html, @"<\s*(br|/p|/li|/h\d|/div)[^>]*>", "\n", RegexOptions.IgnoreCase);
+            s = Regex.Replace(s, @"<\s*li[^>]*>", "\n• ", RegexOptions.IgnoreCase);
+            s = Regex.Replace(s, "<[^>]+>", "");
+            s = WebUtility.HtmlDecode(s).Replace(' ', ' ');
+            s = Regex.Replace(s, @"[ \t\r\f\v]+", " ");
+            s = Regex.Replace(s, @" *\n *", "\n");
+            s = Regex.Replace(s, @"\n{2,}", "\n\n").Trim();
+            return s.Replace("\n", "\r\n");
+        }
+
+        public static bool IsComplete(string folder, int count)
+        {
+            try { return Directory.Exists(folder) && Directory.GetFiles(folder).Length >= Math.Max(1, count); }
+            catch (Exception) { return false; }
+        }
+
+        public static void TryDelete(string f) { try { if (File.Exists(f)) File.Delete(f); } catch (Exception) { } }
+        public static void TryDeleteDir(string d) { try { if (Directory.Exists(d)) Directory.Delete(d, true); } catch (Exception) { } }
+
+        public static List<string> SortModalities(IEnumerable<string> mods)
+        {
+            return mods.Distinct().OrderBy(m => { int i = Array.IndexOf(ModOrder, m); return i < 0 ? 100 : i; })
+                .ThenBy(m => m, StringComparer.Ordinal).ToList();
+        }
+
+        public static string ModalityLabel(string m)
+        {
+            switch (m)
+            {
+                case "MR": return "MR (MRI)";
+                case "PT": return "PT (PET)";
+                case "NM": return "NM (nuclear medicine)";
+                case "CR": return "CR (X-ray)";
+                case "DX": return "DX (X-ray)";
+                case "MG": return "MG (mammography)";
+                case "US": return "US (ultrasound)";
+                case "XA": return "XA (angiography)";
+                case "RTSTRUCT": return "RTSTRUCT (contours)";
+                case "RTPLAN": return "RTPLAN (treatment plan)";
+                case "RTDOSE": return "RTDOSE (dose)";
+                case "RTIMAGE": return "RTIMAGE (portal images)";
+                case "SEG": return "SEG (segmentation)";
+                case "REG": return "REG (registration)";
+                case "SR": return "SR (structured report)";
+                case "PR": return "PR (presentation state)";
+                case "SM": return "SM (slide microscopy)";
+                case "OT": return "OT (other)";
+                default: return m;
+            }
+        }
+
+        // A .tcia manifest is a few key=value lines followed by one SeriesInstanceUID per line.
+        public static List<string> ParseManifest(IEnumerable<string> lines)
+        {
+            return lines.Select(l => l.Trim()).Where(l => Regex.IsMatch(l, @"^[0-9]+(\.[0-9]+){2,}$")).Distinct().ToList();
+        }
+    }
+
+    // ------------------------------------------------------------------ Windows interop
+
+    static class Native
+    {
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] public static extern int SetWindowTheme(IntPtr hWnd, string app, string idList);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")] static extern IntPtr SendMessageStr(IntPtr h, int msg, IntPtr w, string l);
+        [DllImport("user32.dll", EntryPoint = "SendMessageW")] static extern IntPtr SendMessageItem(IntPtr h, int msg, IntPtr w, ref LVITEM l);
+        [DllImport("shlwapi.dll", CharSet = CharSet.Unicode)] public static extern int StrCmpLogicalW(string a, string b);
+        [DllImport("shell32.dll")] static extern int SHGetKnownFolderPath([MarshalAs(UnmanagedType.LPStruct)] Guid rfid, uint flags, IntPtr token, out IntPtr path);
+        [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint flags);
+        [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int value, int size);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(IntPtr h, int index);
+        public static bool HasVScroll(Control c) { return c.IsHandleCreated && (GetWindowLong(c.Handle, -16) & 0x00200000) != 0; }
+        [DllImport("user32.dll", EntryPoint = "SendMessageW")] public static extern IntPtr SendMessagePtr(IntPtr h, int msg, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] static extern bool FlashWindowEx(ref FLASHWINFO f);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct LVITEM
+        {
+            public int mask, iItem, iSubItem, state, stateMask;
+            public IntPtr pszText; public int cchTextMax, iImage; public IntPtr lParam;
+            public int iIndent, iGroupId, cColumns; public IntPtr puColumns, piColFmt; public int iGroup;
+        }
+
+        public static string Downloads()
+        {
+            try
+            {
+                IntPtr p;
+                if (SHGetKnownFolderPath(new Guid("374DE290-123F-4565-9164-39C4925E467B"), 0, IntPtr.Zero, out p) == 0)
+                {
+                    string s = Marshal.PtrToStringUni(p);
+                    Marshal.FreeCoTaskMem(p);
+                    if (!string.IsNullOrEmpty(s)) return s;
+                }
+            }
+            catch (Exception) { }
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+        }
+
+        public static void Cue(TextBox tb, string text)
+        {
+            tb.HandleCreated += (s, e) => SendMessageStr(tb.Handle, 0x1501, (IntPtr)1, text);
+            if (tb.IsHandleCreated) SendMessageStr(tb.Handle, 0x1501, (IntPtr)1, text);
+        }
+
+        public static void SelectAll(ListView lv)
+        {
+            var it = new LVITEM();
+            it.stateMask = 2; it.state = 2;   // LVIS_SELECTED
+            SendMessageItem(lv.Handle, 0x102B, (IntPtr)(-1), ref it);   // LVM_SETITEMSTATE, all items
+        }
+
+        public static void Flash(IntPtr h)
+        {
+            var f = new FLASHWINFO();
+            f.cbSize = (uint)Marshal.SizeOf(typeof(FLASHWINFO));
+            f.hwnd = h; f.dwFlags = 3 | 12; f.uCount = 5;   // FLASHW_ALL | FLASHW_TIMERNOFG
+            FlashWindowEx(ref f);
+        }
+    }
+
+    [ComImport, Guid("ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ITaskbarList3
+    {
+        void HrInit();
+        void AddTab(IntPtr hwnd);
+        void DeleteTab(IntPtr hwnd);
+        void ActivateTab(IntPtr hwnd);
+        void SetActiveAlt(IntPtr hwnd);
+        void MarkFullscreenWindow(IntPtr hwnd, [MarshalAs(UnmanagedType.Bool)] bool fullscreen);
+        void SetProgressValue(IntPtr hwnd, ulong completed, ulong total);
+        void SetProgressState(IntPtr hwnd, int flags);
+    }
+
+    [ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090"), ClassInterface(ClassInterfaceType.None)]
+    class TaskbarInstance { }
+
+    static class FolderPicker
+    {
+        [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")]
+        class FileOpenDialogCom { }
+
+        [ComImport, Guid("42f85136-db7e-439c-85f1-e4075d135fc8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IFileDialog
+        {
+            [PreserveSig] int Show(IntPtr parent);
+            void SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);
+            void SetFileTypeIndex(uint iFileType);
+            void GetFileTypeIndex(out uint piFileType);
+            void Advise(IntPtr pfde, out uint pdwCookie);
+            void Unadvise(uint dwCookie);
+            void SetOptions(uint fos);
+            void GetOptions(out uint pfos);
+            void SetDefaultFolder(IShellItem psi);
+            void SetFolder(IShellItem psi);
+            void GetFolder(out IShellItem ppsi);
+            void GetCurrentSelection(out IShellItem ppsi);
+            void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+            void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);
+            void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+            void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
+            void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
+            void GetResult(out IShellItem ppsi);
+        }
+
+        [ComImport, Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IShellItem
+        {
+            void BindToHandler(IntPtr pbc, [MarshalAs(UnmanagedType.LPStruct)] Guid bhid, [MarshalAs(UnmanagedType.LPStruct)] Guid riid, out IntPtr ppv);
+            void GetParent(out IShellItem ppsi);
+            void GetDisplayName(uint sigdnName, [MarshalAs(UnmanagedType.LPWStr)] out string ppszName);
+            void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+            void Compare(IShellItem psi, uint hint, out int piOrder);
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+        static extern void SHCreateItemFromParsingName(string path, IntPtr pbc, [MarshalAs(UnmanagedType.LPStruct)] Guid riid, [MarshalAs(UnmanagedType.Interface)] out IShellItem item);
+
+        public static string Pick(IWin32Window owner, string title, string initial)
+        {
+            try
+            {
+                var dlg = (IFileDialog)new FileOpenDialogCom();
+                uint opts;
+                dlg.GetOptions(out opts);
+                dlg.SetOptions(opts | 0x20 | 0x40);   // FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM
+                dlg.SetTitle(title);
+                dlg.SetOkButtonLabel("Save here");
+                if (!string.IsNullOrEmpty(initial) && Directory.Exists(initial))
+                {
+                    IShellItem start;
+                    SHCreateItemFromParsingName(initial, IntPtr.Zero, typeof(IShellItem).GUID, out start);
+                    dlg.SetFolder(start);
+                }
+                if (dlg.Show(owner.Handle) != 0) return null;
+                IShellItem res;
+                dlg.GetResult(out res);
+                string path;
+                res.GetDisplayName(0x80058000, out path);   // SIGDN_FILESYSPATH
+                return path;
+            }
+            catch (COMException) { }
+            catch (InvalidCastException) { }
+            using (var d = new FolderBrowserDialog())
+            {
+                d.Description = title; d.SelectedPath = initial; d.ShowNewFolderButton = true;
+                return d.ShowDialog(owner) == DialogResult.OK ? d.SelectedPath : null;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ icon
+
+    static class AppIcon
+    {
+        public static Bitmap Render(int size)
+        {
+            var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.Clear(Color.Transparent);
+                float s = size, pad = Math.Max(0.5f, s * 0.04f);
+                var r = new RectangleF(pad, pad, s - 2 * pad, s - 2 * pad);
+                using (var path = Rounded(r, s * 0.22f))
+                using (var br = new LinearGradientBrush(new PointF(0, 0), new PointF(s, s), Color.FromArgb(26, 164, 170), Color.FromArgb(13, 50, 80)))
+                    g.FillPath(br, path);
+                float rw = Math.Max(1.4f, s * 0.085f);
+                using (var pen = new Pen(Color.FromArgb(110, 255, 255, 255), rw))
+                    g.DrawEllipse(pen, s * 0.20f, s * 0.20f, s * 0.60f, s * 0.60f);
+                using (var b = new SolidBrush(Color.White))
+                {
+                    float cx = s * 0.5f, w = Math.Max(1.5f, s * 0.12f);
+                    g.FillRectangle(b, cx - w / 2, s * 0.29f, w, s * 0.24f);
+                    g.FillPolygon(b, new PointF[] { new PointF(s * 0.32f, s * 0.49f), new PointF(s * 0.68f, s * 0.49f), new PointF(cx, s * 0.72f) });
+                }
+            }
+            return bmp;
+        }
+
+        static GraphicsPath Rounded(RectangleF r, float rad)
+        {
+            var p = new GraphicsPath();
+            float d = rad * 2;
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        public static Icon MakeIcon() { return new Icon(new MemoryStream(BuildIco(new int[] { 16, 20, 24, 32, 40, 48, 64, 256 }))); }
+
+        public static byte[] BuildIco(int[] sizes)
+        {
+            var images = new List<byte[]>();
+            foreach (int sz in sizes) using (var bmp = Render(sz)) images.Add(sz >= 256 ? Png(bmp) : Dib(bmp));
+            var ms = new MemoryStream();
+            var w = new BinaryWriter(ms);
+            w.Write((short)0); w.Write((short)1); w.Write((short)sizes.Length);
+            int offset = 6 + 16 * sizes.Length;
+            for (int i = 0; i < sizes.Length; i++)
+            {
+                byte dim = (byte)(sizes[i] >= 256 ? 0 : sizes[i]);
+                w.Write(dim); w.Write(dim); w.Write((byte)0); w.Write((byte)0);
+                w.Write((short)1); w.Write((short)32); w.Write(images[i].Length); w.Write(offset);
+                offset += images[i].Length;
+            }
+            foreach (var img in images) w.Write(img);
+            w.Flush();
+            return ms.ToArray();
+        }
+
+        static byte[] Png(Bitmap b) { using (var ms = new MemoryStream()) { b.Save(ms, ImageFormat.Png); return ms.ToArray(); } }
+
+        static byte[] Dib(Bitmap b)
+        {
+            int n = b.Width;
+            var ms = new MemoryStream();
+            var w = new BinaryWriter(ms);
+            w.Write(40); w.Write(n); w.Write(n * 2); w.Write((short)1); w.Write((short)32);
+            w.Write(0); w.Write(n * n * 4); w.Write(0); w.Write(0); w.Write(0); w.Write(0);
+            for (int y = n - 1; y >= 0; y--)
+                for (int x = 0; x < n; x++) { Color c = b.GetPixel(x, y); w.Write(c.B); w.Write(c.G); w.Write(c.R); w.Write(c.A); }
+            w.Write(new byte[((n + 31) / 32) * 4 * n]);
+            w.Flush();
+            return ms.ToArray();
+        }
+    }
+
+    // ------------------------------------------------------------------ small custom controls
+
+    class DBListView : ListView
+    {
+        public bool Dark;
+        public DBListView()
+        {
+            DoubleBuffered = true;
+            View = View.Details;
+            FullRowSelect = true;
+            HideSelection = false;
+            BorderStyle = BorderStyle.None;
+        }
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            try
+            {
+                Native.SetWindowTheme(Handle, Dark ? "DarkMode_Explorer" : "Explorer", null);
+                if (Dark)
+                {
+                    IntPtr header = Native.SendMessagePtr(Handle, 0x101F, IntPtr.Zero, IntPtr.Zero);   // LVM_GETHEADER
+                    if (header != IntPtr.Zero) Native.SetWindowTheme(header, "DarkMode_ItemsView", null);
+                }
+            }
+            catch (Exception) { }
+        }
+    }
+
+    class SectionHeader : Control
+    {
+        public string Number = "";
+        public Color Accent = Color.Teal;
+        public Font NumFont;
+        public SectionHeader()
+        {
+            // Background is erased the standard way (like a Label) so it matches the panels around it.
+            SetStyle(ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        }
+        protected override void OnTextChanged(EventArgs e) { base.OnTextChanged(e); Invalidate(); }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            int x = 0;
+            if (Number != "")
+            {
+                int d = (int)(Font.Height * 1.25);
+                int y = (Height - d) / 2;
+                using (var b = new SolidBrush(Accent)) g.FillEllipse(b, 0, y, d, d);
+                TextRenderer.DrawText(g, Number, NumFont ?? Font, new Rectangle(0, y, d, d), Color.White,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                x = d + d / 2;
+            }
+            TextRenderer.DrawText(g, Text, Font, new Rectangle(x, 0, Math.Max(0, Width - x), Height), ForeColor,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        }
+    }
+
+    // WinForms only raises Click if the window under the cursor at mouse-up is the button itself, so
+    // any overlay window (screen tools, accessibility aids) silently swallows clicks. Fall back to the
+    // mouse-up position when that happens.
+    class FlatButton : Button
+    {
+        bool pressed, clickedByBase;
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left) pressed = true;
+            base.OnMouseDown(e);
+        }
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            bool fire = e.Button == MouseButtons.Left && pressed && Enabled && ClientRectangle.Contains(e.Location);
+            pressed = false;
+            clickedByBase = false;
+            base.OnMouseUp(e);
+            if (fire && !clickedByBase && !IsDisposed) OnClick(EventArgs.Empty);
+        }
+        protected override void OnClick(EventArgs e)
+        {
+            clickedByBase = true;
+            base.OnClick(e);
+        }
+    }
+
+    class ThinBar : Control
+    {
+        double v;
+        public Color Fill = Color.Teal, Track = Color.LightGray;
+        public ThinBar() { SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true); }
+        public double Value
+        {
+            get { return v; }
+            set { double nv = Math.Max(0, Math.Min(1, value)); if (Math.Abs(nv - v) > 0.0005) { v = nv; Invalidate(); } }
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Track);
+            int w = (int)Math.Round(Width * v);
+            if (w > 0) using (var b = new SolidBrush(Fill)) e.Graphics.FillRectangle(b, 0, 0, w, Height);
+        }
+    }
+
+    // ------------------------------------------------------------------ main window
+
+    class MainForm : Form
+    {
+        Color cNavy, cAccent, cAccentDark, cAccentText, cBg, cPanel, cInput, cBorder, cMuted, cText, cGreen, cRed,
+            cSection, cStatusBg, cHover, cPressed, cDisabled, cTrack;
+        bool dark;
+        const int MaxWorkers = 2;
+        const string StSaved = "✓ Saved";
+        const string StQueued = "In downloads";
+
+        readonly string[] startArgs;
+        float S = 1f;
+        Font fBase, fBold, fTitle, fSmall, fSmallBold, fSection, fNum;
+        readonly string appDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TCIA Downloader");
+        string saveRoot;
+
+        List<CollectionInfo> collections = new List<CollectionInfo>();
+        bool webLoaded, indexing, catalogBusy, suppressColl, suppressCheck, suppressMod;
+        int indexDone, indexTotal, lastShownCount;
+        readonly Dictionary<string, List<string>> patientCache = new Dictionary<string, List<string>>();
+        readonly Dictionary<string, List<SeriesInfo>> seriesCache = new Dictionary<string, List<SeriesInfo>>();
+        CollectionInfo curCollection;
+        string curPatient, pendingPatient;
+        List<SeriesInfo> curSeries = new List<SeriesInfo>();
+        List<string> patientsAll = new List<string>(), patientsShown = new List<string>();
+        int patToken, seriesToken, sortCol;
+        bool sortAsc = true;
+        readonly Dictionary<string, ListViewItem> seriesRows = new Dictionary<string, ListViewItem>();
+
+        readonly List<QueueItem> queue = new List<QueueItem>();
+        readonly object qlock = new object();
+        readonly Dictionary<string, QueueItem> byUid = new Dictionary<string, QueueItem>();
+        CancellationTokenSource runCts = new CancellationTokenSource();
+        int activeWorkers;
+        long lastRecv;
+        DateTime lastTick = DateTime.UtcNow;
+        double speed;
+        bool wasBusy, sleepBlocked;
+        ITaskbarList3 taskbar;
+
+        Label lblSavePath, lblStatus, lblCollInfo, lblCollTitle, lblCollMeta, lblPatCount, lblSeriesSum, lblQueueStatus;
+        LinkLabel lnkColl;
+        TextBox tbFind, tbCollFilter, tbPatFilter, tbAbstract;
+        ComboBox cbModality;
+        Button btnChange, btnOpen, btnFind, btnManifest, btnRefresh, btnPatAll, btnPatDownload, btnCheckAll, btnCheckNone, btnDownload, btnRetry, btnClear, btnCancelAll, btnOpen2;
+        SectionHeader hdrPat, hdrSeries;
+        DBListView lvColl, lvPat, lvSeries, lvQueue;
+        ThinBar bar;
+        SplitContainer splitMain, splitA, splitB;
+        readonly ToolTip tips = new ToolTip();
+        System.Windows.Forms.Timer uiTimer, collFilterTimer, patFilterTimer, patSelectTimer;
+
+        // Follows the Windows "app mode" setting (Settings > Personalization > Colors).
+        void ApplyPalette()
+        {
+            dark = false;
+            try
+            {
+                using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object v = k == null ? null : k.GetValue("AppsUseLightTheme");
+                    dark = v is int && (int)v == 0;
+                }
+            }
+            catch (Exception) { }
+            if (dark)
+            {
+                cNavy = Color.FromArgb(16, 36, 53); cAccent = Color.FromArgb(17, 138, 148); cAccentDark = Color.FromArgb(12, 110, 119);
+                cAccentText = Color.FromArgb(92, 205, 210);
+                cBg = Color.FromArgb(31, 32, 35); cPanel = Color.FromArgb(41, 43, 47); cInput = Color.FromArgb(49, 51, 56);
+                cBorder = Color.FromArgb(64, 67, 73); cMuted = Color.FromArgb(160, 168, 177); cText = Color.FromArgb(231, 234, 238);
+                cGreen = Color.FromArgb(98, 206, 140); cRed = Color.FromArgb(244, 120, 120); cSection = Color.FromArgb(236, 239, 242);
+                cStatusBg = Color.FromArgb(37, 39, 43); cHover = Color.FromArgb(56, 59, 65); cPressed = Color.FromArgb(68, 72, 79);
+                cDisabled = Color.FromArgb(66, 70, 76); cTrack = Color.FromArgb(54, 57, 62);
+            }
+            else
+            {
+                cNavy = Color.FromArgb(15, 42, 63); cAccent = Color.FromArgb(14, 124, 134); cAccentDark = Color.FromArgb(9, 94, 103);
+                cAccentText = Color.FromArgb(9, 94, 103);
+                cBg = Color.FromArgb(242, 245, 247); cPanel = Color.White; cInput = Color.White;
+                cBorder = Color.FromArgb(211, 218, 224); cMuted = Color.FromArgb(98, 112, 126); cText = Color.FromArgb(27, 36, 45);
+                cGreen = Color.FromArgb(22, 128, 74); cRed = Color.FromArgb(190, 45, 45); cSection = Color.FromArgb(15, 42, 63);
+                cStatusBg = Color.FromArgb(228, 234, 238); cHover = Color.FromArgb(231, 238, 242); cPressed = Color.FromArgb(214, 225, 232);
+                cDisabled = Color.FromArgb(196, 206, 212); cTrack = Color.FromArgb(220, 228, 233);
+            }
+        }
+
+        void StyleInput(Control c)
+        {
+            c.BackColor = cInput;
+            c.ForeColor = cText;
+            if (dark)
+            {
+                string theme = c is ComboBox ? "DarkMode_CFD" : "DarkMode_Explorer";
+                c.HandleCreated += (s, e) => { try { Native.SetWindowTheme(c.Handle, theme, null); } catch (Exception) { } };
+            }
+        }
+
+        DBListView NewList()
+        {
+            var lv = new DBListView();
+            lv.Dark = dark;
+            lv.BackColor = cPanel;
+            lv.ForeColor = cText;
+            return lv;
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            if (dark) { try { int on = 1; Native.DwmSetWindowAttribute(Handle, 20, ref on, 4); } catch (Exception) { } }
+        }
+
+        public MainForm(string[] args)
+        {
+            startArgs = args ?? new string[0];
+            ApplyPalette();
+            using (var g = CreateGraphics()) S = g.DpiX / 96f;
+            fBase = new Font("Segoe UI", 9.5f);
+            fBold = new Font("Segoe UI Semibold", 9.5f);
+            fTitle = new Font("Segoe UI Semibold", 15f);
+            fSmall = new Font("Segoe UI", 8.75f);
+            fSmallBold = new Font("Segoe UI Semibold", 7.5f);
+            fSection = new Font("Segoe UI Semibold", 11f);
+            fNum = new Font("Segoe UI Semibold", 8.5f);
+
+            AutoScaleMode = AutoScaleMode.None;
+            Font = fBase;
+            BackColor = cBg;
+            ForeColor = cText;
+            Text = "TCIA DICOM Downloader";
+            try { Icon = AppIcon.MakeIcon(); } catch (Exception) { }
+            StartPosition = FormStartPosition.CenterScreen;
+            var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Size want = new Size(Px(1440), Px(900));
+            MinimumSize = new Size(Math.Min(Px(1000), wa.Width), Math.Min(Px(660), wa.Height));
+            if (want.Width > wa.Width - 40 || want.Height > wa.Height - 40)
+            {
+                Size = new Size(Math.Min(want.Width, wa.Width), Math.Min(want.Height, wa.Height));
+                WindowState = FormWindowState.Maximized;
+            }
+            else Size = want;
+            AllowDrop = true;
+            tips.AutoPopDelay = 15000;
+
+            LoadSettings();
+            SuspendLayout();
+            BuildUi();
+            WireEvents();
+            ResumeLayout(true);
+
+            UpdateSavePathLabel();
+            ShowCollectionDetails(null);
+            ClearSeries("Pick a collection, then a patient, to see their scans here.");
+            UpdatePatientButtons();
+            UpdateCollInfoLabel();
+        }
+
+        int Px(int v) { return (int)Math.Round(v * S); }
+
+        // ============================================================ layout
+
+        TableLayoutPanel Grid(int cols, int rows)
+        {
+            var t = new TableLayoutPanel();
+            t.ColumnCount = cols; t.RowCount = rows;
+            t.Dock = DockStyle.Fill;
+            t.Margin = new Padding(0); t.Padding = new Padding(0);
+            t.BackColor = cBg;
+            return t;
+        }
+
+        Button Btn(string text, int kind)
+        {
+            var b = new FlatButton();
+            b.Text = text;
+            b.FlatStyle = FlatStyle.Flat;
+            b.UseVisualStyleBackColor = false;
+            b.AutoSize = true;
+            b.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            b.Padding = new Padding(Px(8), 0, Px(8), 0);
+            b.Margin = new Padding(Px(3), 0, Px(3), 0);
+            b.MinimumSize = new Size(0, Px(32));
+            b.Cursor = Cursors.Hand;
+            b.Anchor = AnchorStyles.Left;
+            if (kind == 1)
+            {
+                b.BackColor = cAccent; b.ForeColor = Color.White; b.Font = fBold;
+                b.FlatAppearance.BorderSize = 0;
+                b.FlatAppearance.MouseOverBackColor = cAccentDark;
+                b.FlatAppearance.MouseDownBackColor = cNavy;
+                b.EnabledChanged += (s, e) => { b.BackColor = b.Enabled ? cAccent : cDisabled; };
+            }
+            else if (kind == 2)
+            {
+                b.BackColor = Color.FromArgb(34, 66, 92); b.ForeColor = Color.White;
+                b.FlatAppearance.BorderSize = 0;
+                b.FlatAppearance.MouseOverBackColor = Color.FromArgb(52, 90, 120);
+                b.FlatAppearance.MouseDownBackColor = Color.FromArgb(24, 52, 74);
+            }
+            else
+            {
+                b.BackColor = cPanel; b.ForeColor = cText;
+                b.FlatAppearance.BorderColor = cBorder;
+                b.FlatAppearance.BorderSize = 1;
+                b.FlatAppearance.MouseOverBackColor = cHover;
+                b.FlatAppearance.MouseDownBackColor = cPressed;
+            }
+            return b;
+        }
+
+        SectionHeader Section(string num, string text)
+        {
+            var h = new SectionHeader();
+            h.Number = num; h.Text = text; h.Font = fSection; h.NumFont = fNum;
+            h.ForeColor = cSection; h.Accent = cAccent; h.BackColor = cBg;
+            h.Dock = DockStyle.Fill; h.Margin = new Padding(0);
+            return h;
+        }
+
+        Label SmallLabel()
+        {
+            var l = new Label();
+            l.Dock = DockStyle.Fill; l.Margin = new Padding(0);
+            l.ForeColor = cMuted; l.Font = fSmall;
+            l.TextAlign = ContentAlignment.MiddleLeft; l.AutoEllipsis = true;
+            return l;
+        }
+
+        Control Framed(Control c)
+        {
+            var p = new Panel();
+            p.Dock = DockStyle.Fill; p.Margin = new Padding(0);
+            p.Padding = new Padding(1); p.BackColor = cBorder;
+            c.Dock = DockStyle.Fill;
+            p.Controls.Add(c);
+            return p;
+        }
+
+        void BuildUi()
+        {
+            var root = Grid(1, 4);
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(64)));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(50)));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(26)));
+            root.Controls.Add(BuildHeader(), 0, 0);
+            root.Controls.Add(BuildToolbar(), 0, 1);
+            root.Controls.Add(BuildMain(), 0, 2);
+            lblStatus = new Label();
+            lblStatus.Dock = DockStyle.Fill; lblStatus.Margin = new Padding(0);
+            lblStatus.TextAlign = ContentAlignment.MiddleLeft; lblStatus.AutoEllipsis = true;
+            lblStatus.Padding = new Padding(Px(12), 0, Px(12), 0);
+            lblStatus.BackColor = cStatusBg; lblStatus.ForeColor = cMuted;
+            root.Controls.Add(lblStatus, 0, 3);
+            Controls.Add(root);
+        }
+
+        Control BuildHeader()
+        {
+            var p = Grid(5, 1);
+            p.BackColor = cNavy;
+            p.Padding = new Padding(Px(16), 0, Px(12), 0);
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Px(48)));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            p.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            var pic = new PictureBox();
+            pic.Image = AppIcon.Render(Px(40)); pic.SizeMode = PictureBoxSizeMode.CenterImage;
+            pic.Dock = DockStyle.Fill; pic.Margin = new Padding(0); pic.BackColor = cNavy;
+
+            var titles = Grid(1, 2);
+            titles.BackColor = cNavy;
+            titles.Margin = new Padding(Px(10), 0, 0, 0);
+            titles.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            titles.RowStyles.Add(new RowStyle(SizeType.Percent, 56));
+            titles.RowStyles.Add(new RowStyle(SizeType.Percent, 44));
+            var t1 = new Label();
+            t1.Text = "TCIA DICOM Downloader"; t1.Font = fTitle; t1.ForeColor = Color.White;
+            t1.AutoSize = true; t1.Anchor = AnchorStyles.Left | AnchorStyles.Bottom; t1.Margin = new Padding(0);
+            var t2 = new Label();
+            t2.Text = "Search The Cancer Imaging Archive and save scans straight to your computer";
+            t2.ForeColor = Color.FromArgb(160, 190, 212); t2.AutoSize = true;
+            t2.Anchor = AnchorStyles.Left | AnchorStyles.Top; t2.Margin = new Padding(Px(2), 0, 0, 0);
+            titles.Controls.Add(t1, 0, 0);
+            titles.Controls.Add(t2, 0, 1);
+
+            var save = new TableLayoutPanel();
+            save.ColumnCount = 1; save.RowCount = 2;
+            save.AutoSize = true; save.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            save.Anchor = AnchorStyles.Right; save.BackColor = cNavy;
+            save.Margin = new Padding(Px(12), 0, Px(10), 0); save.Padding = new Padding(0);
+            var s1 = new Label();
+            s1.Text = "SAVING FILES TO"; s1.Font = fSmallBold; s1.ForeColor = Color.FromArgb(125, 160, 186);
+            s1.AutoSize = true; s1.Anchor = AnchorStyles.Right; s1.Margin = new Padding(0);
+            lblSavePath = new Label();
+            lblSavePath.ForeColor = Color.White; lblSavePath.Font = fBold;
+            lblSavePath.AutoSize = true; lblSavePath.Anchor = AnchorStyles.Right; lblSavePath.Margin = new Padding(0, Px(2), 0, 0);
+            save.Controls.Add(s1, 0, 0);
+            save.Controls.Add(lblSavePath, 0, 1);
+
+            btnChange = Btn("Change…", 2);
+            btnOpen = Btn("Open folder", 2);
+            p.Controls.Add(pic, 0, 0);
+            p.Controls.Add(titles, 1, 0);
+            p.Controls.Add(save, 2, 0);
+            p.Controls.Add(btnChange, 3, 0);
+            p.Controls.Add(btnOpen, 4, 0);
+            return p;
+        }
+
+        Control BuildToolbar()
+        {
+            var p = Grid(7, 1);
+            p.BackColor = cPanel;
+            p.Padding = new Padding(Px(14), Px(5), Px(14), Px(6));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Px(330)));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Px(16)));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            p.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            p.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            tbFind = new TextBox();
+            tbFind.Anchor = AnchorStyles.Left | AnchorStyles.Right; tbFind.Margin = new Padding(0, 0, Px(4), 0);
+            StyleInput(tbFind);
+            Native.Cue(tbFind, "Find a patient ID in every collection, e.g. LUNG1-001");
+            btnFind = Btn("Find patient", 1);
+            btnManifest = Btn("Open manifest (.tcia)…", 0);
+            btnRefresh = Btn("Refresh catalog", 0);
+            var hint = new Label();
+            hint.Text = "Tip: drag a .tcia manifest onto this window to download it";
+            hint.AutoSize = true; hint.ForeColor = cMuted; hint.Font = fSmall; hint.Anchor = AnchorStyles.Right; hint.BackColor = cPanel;
+
+            p.Controls.Add(tbFind, 0, 0);
+            p.Controls.Add(btnFind, 1, 0);
+            p.Controls.Add(btnManifest, 3, 0);
+            p.Controls.Add(btnRefresh, 4, 0);
+            p.Controls.Add(hint, 6, 0);
+            p.Paint += (s, e) => { using (var pen = new Pen(cBorder)) e.Graphics.DrawLine(pen, 0, p.Height - 1, p.Width, p.Height - 1); };
+            return p;
+        }
+
+        Control BuildMain()
+        {
+            var host = new Panel();
+            host.Dock = DockStyle.Fill; host.Margin = new Padding(0);
+            host.Padding = new Padding(Px(14), Px(10), Px(14), Px(8)); host.BackColor = cBg;
+
+            splitMain = new SplitContainer();
+            splitMain.Dock = DockStyle.Fill; splitMain.Orientation = Orientation.Horizontal;
+            splitMain.SplitterWidth = Px(12); splitMain.FixedPanel = FixedPanel.Panel2; splitMain.BackColor = cBg;
+            splitA = new SplitContainer();
+            splitA.Dock = DockStyle.Fill; splitA.Orientation = Orientation.Vertical;
+            splitA.SplitterWidth = Px(14); splitA.FixedPanel = FixedPanel.Panel1; splitA.BackColor = cBg;
+            splitB = new SplitContainer();
+            splitB.Dock = DockStyle.Fill; splitB.Orientation = Orientation.Vertical;
+            splitB.SplitterWidth = Px(14); splitB.FixedPanel = FixedPanel.Panel1; splitB.BackColor = cBg;
+
+            splitA.Panel1.Controls.Add(BuildCollections());
+            splitB.Panel1.Controls.Add(BuildPatients());
+            splitB.Panel2.Controls.Add(BuildSeries());
+            splitA.Panel2.Controls.Add(splitB);
+            splitMain.Panel1.Controls.Add(splitA);
+            splitMain.Panel2.Controls.Add(BuildQueue());
+            host.Controls.Add(splitMain);
+            return host;
+        }
+
+        Control BuildCollections()
+        {
+            var t = Grid(1, 5);
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(32)));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(34)));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(24)));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(128)));
+            t.Controls.Add(Section("1", "Choose a collection"), 0, 0);
+
+            var f = Grid(2, 1);
+            f.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            f.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Px(200)));
+            f.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tbCollFilter = new TextBox();
+            tbCollFilter.Anchor = AnchorStyles.Left | AnchorStyles.Right; tbCollFilter.Margin = new Padding(0, 0, Px(6), 0);
+            StyleInput(tbCollFilter);
+            Native.Cue(tbCollFilter, "Search: breast, lung, prostate, RTDOSE…");
+            cbModality = new ComboBox();
+            cbModality.DropDownStyle = ComboBoxStyle.DropDownList;
+            StyleInput(cbModality);
+            cbModality.Anchor = AnchorStyles.Left | AnchorStyles.Right; cbModality.Margin = new Padding(0);
+            cbModality.MaxDropDownItems = 22;
+            cbModality.Items.Add(new ModItem(null, "All modalities", 0));
+            cbModality.SelectedIndex = 0;
+            f.Controls.Add(tbCollFilter, 0, 0);
+            f.Controls.Add(cbModality, 1, 0);
+            t.Controls.Add(f, 0, 1);
+
+            lvColl = NewList();
+            lvColl.MultiSelect = false;
+            lvColl.Columns.Add("Collection", Px(170));
+            lvColl.Columns.Add("Cancer type / site", Px(150));
+            lvColl.Columns.Add("Subjects", Px(68), HorizontalAlignment.Right);
+            lvColl.Columns.Add("Modalities", Px(150));
+            t.Controls.Add(Framed(lvColl), 0, 2);
+
+            lblCollInfo = SmallLabel();
+            t.Controls.Add(lblCollInfo, 0, 3);
+            t.Controls.Add(BuildDetails(), 0, 4);
+            return t;
+        }
+
+        Control BuildDetails()
+        {
+            var card = Grid(1, 4);
+            card.BackColor = cPanel;
+            card.Margin = new Padding(0, Px(2), 0, 0);
+            card.Padding = new Padding(Px(12), Px(6), Px(10), Px(2));
+            card.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            card.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(24)));
+            card.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(20)));
+            card.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            card.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(22)));
+
+            lblCollTitle = new Label();
+            lblCollTitle.Dock = DockStyle.Fill; lblCollTitle.Margin = new Padding(0);
+            lblCollTitle.Font = fBold; lblCollTitle.ForeColor = cSection; lblCollTitle.AutoEllipsis = true;
+            lblCollTitle.TextAlign = ContentAlignment.MiddleLeft; lblCollTitle.BackColor = cPanel;
+            lblCollMeta = new Label();
+            lblCollMeta.Dock = DockStyle.Fill; lblCollMeta.Margin = new Padding(0);
+            lblCollMeta.Font = fSmall; lblCollMeta.ForeColor = cAccentText; lblCollMeta.AutoEllipsis = true;
+            lblCollMeta.TextAlign = ContentAlignment.MiddleLeft; lblCollMeta.BackColor = cPanel;
+            tbAbstract = new TextBox();
+            tbAbstract.Multiline = true; tbAbstract.ReadOnly = true; tbAbstract.BorderStyle = BorderStyle.None;
+            StyleInput(tbAbstract);
+            tbAbstract.BackColor = cPanel; tbAbstract.Font = fSmall;
+            tbAbstract.ScrollBars = ScrollBars.Vertical; tbAbstract.Dock = DockStyle.Fill; tbAbstract.TabStop = false;
+            tbAbstract.Margin = new Padding(0, Px(2), 0, Px(2));
+            lnkColl = new LinkLabel();
+            lnkColl.Dock = DockStyle.Fill; lnkColl.Margin = new Padding(0); lnkColl.BackColor = cPanel;
+            lnkColl.Text = "Open this collection on the TCIA website";
+            lnkColl.LinkColor = cAccentText; lnkColl.ActiveLinkColor = cAccent; lnkColl.Font = fSmall;
+            lnkColl.TextAlign = ContentAlignment.MiddleLeft; lnkColl.LinkBehavior = LinkBehavior.HoverUnderline;
+
+            card.Controls.Add(lblCollTitle, 0, 0);
+            card.Controls.Add(lblCollMeta, 0, 1);
+            card.Controls.Add(tbAbstract, 0, 2);
+            card.Controls.Add(lnkColl, 0, 3);
+            card.Paint += (s, e) => { using (var pen = new Pen(cBorder)) e.Graphics.DrawRectangle(pen, 0, 0, card.Width - 1, card.Height - 1); };
+            return card;
+        }
+
+        Control BuildPatients()
+        {
+            var t = Grid(1, 5);
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(32)));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(34)));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(24)));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(44)));
+            hdrPat = Section("2", "Patients");
+            t.Controls.Add(hdrPat, 0, 0);
+
+            var f = Grid(2, 1);
+            f.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            f.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            f.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tbPatFilter = new TextBox();
+            tbPatFilter.Anchor = AnchorStyles.Left | AnchorStyles.Right; tbPatFilter.Margin = new Padding(0, 0, Px(4), 0);
+            StyleInput(tbPatFilter);
+            Native.Cue(tbPatFilter, "Filter patient IDs…");
+            btnPatAll = Btn("Select all", 0);
+            btnPatAll.MinimumSize = new Size(0, Px(28)); btnPatAll.Margin = new Padding(Px(2), 0, 0, 0);
+            f.Controls.Add(tbPatFilter, 0, 0);
+            f.Controls.Add(btnPatAll, 1, 0);
+            t.Controls.Add(f, 0, 1);
+
+            lvPat = NewList();
+            lvPat.VirtualMode = true; lvPat.MultiSelect = true;
+            lvPat.HeaderStyle = ColumnHeaderStyle.Nonclickable;
+            lvPat.Columns.Add("Patient ID", Px(180));
+            t.Controls.Add(Framed(lvPat), 0, 2);
+
+            lblPatCount = SmallLabel();
+            t.Controls.Add(lblPatCount, 0, 3);
+
+            btnPatDownload = Btn("Download this patient", 0);
+            btnPatDownload.AutoSize = false; btnPatDownload.Dock = DockStyle.Fill;
+            btnPatDownload.Margin = new Padding(0, Px(4), 0, Px(2));
+            t.Controls.Add(btnPatDownload, 0, 4);
+            return t;
+        }
+
+        Control BuildSeries()
+        {
+            var t = Grid(1, 4);
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(32)));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(34)));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(68)));
+            hdrSeries = Section("3", "Series");
+            t.Controls.Add(hdrSeries, 0, 0);
+
+            var tools = new FlowLayoutPanel();
+            tools.Dock = DockStyle.Fill; tools.Margin = new Padding(0); tools.Padding = new Padding(0);
+            tools.WrapContents = false; tools.BackColor = cBg;
+            btnCheckAll = Btn("Tick all", 0);
+            btnCheckNone = Btn("Tick none", 0);
+            foreach (var b in new[] { btnCheckAll, btnCheckNone }) { b.MinimumSize = new Size(0, Px(28)); b.Margin = new Padding(0, Px(2), Px(6), 0); }
+            var hint = new Label();
+            hint.Text = "Ticked series will be downloaded. Series are grouped by study (scan date).";
+            hint.AutoSize = true; hint.ForeColor = cMuted; hint.Font = fSmall; hint.Margin = new Padding(Px(4), Px(9), 0, 0);
+            tools.Controls.Add(btnCheckAll);
+            tools.Controls.Add(btnCheckNone);
+            tools.Controls.Add(hint);
+            t.Controls.Add(tools, 0, 1);
+
+            lvSeries = NewList();
+            lvSeries.CheckBoxes = true; lvSeries.ShowGroups = true; lvSeries.MultiSelect = true;
+            lvSeries.Columns.Add("Modality", Px(96));
+            lvSeries.Columns.Add("Series description", Px(220));
+            lvSeries.Columns.Add("No.", Px(44), HorizontalAlignment.Right);
+            lvSeries.Columns.Add("Images", Px(62), HorizontalAlignment.Right);
+            lvSeries.Columns.Add("Size", Px(72), HorizontalAlignment.Right);
+            lvSeries.Columns.Add("Status", Px(100));
+            t.Controls.Add(Framed(lvSeries), 0, 2);
+
+            var bottom = Grid(2, 1);
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            bottom.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            bottom.Padding = new Padding(0, Px(8), 0, Px(4));
+            lblSeriesSum = new Label();
+            lblSeriesSum.Dock = DockStyle.Fill; lblSeriesSum.Margin = new Padding(0, 0, Px(10), 0);
+            lblSeriesSum.TextAlign = ContentAlignment.MiddleLeft; lblSeriesSum.ForeColor = cMuted;
+            btnDownload = Btn("Download ticked series", 1);
+            btnDownload.MinimumSize = new Size(Px(230), Px(44));
+            btnDownload.Anchor = AnchorStyles.Right; btnDownload.Margin = new Padding(0);
+            bottom.Controls.Add(lblSeriesSum, 0, 0);
+            bottom.Controls.Add(btnDownload, 1, 0);
+            t.Controls.Add(bottom, 0, 3);
+            return t;
+        }
+
+        Control BuildQueue()
+        {
+            var t = Grid(1, 3);
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(38)));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, Px(9)));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            var top = Grid(6, 1);
+            top.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Px(150)));
+            top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            for (int i = 0; i < 4; i++) top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            top.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            top.Controls.Add(Section("4", "Downloads"), 0, 0);
+            lblQueueStatus = new Label();
+            lblQueueStatus.Dock = DockStyle.Fill; lblQueueStatus.Margin = new Padding(0);
+            lblQueueStatus.TextAlign = ContentAlignment.MiddleLeft; lblQueueStatus.AutoEllipsis = true;
+            lblQueueStatus.ForeColor = cMuted;
+            top.Controls.Add(lblQueueStatus, 1, 0);
+            btnRetry = Btn("Retry failed", 0);
+            btnClear = Btn("Clear finished", 0);
+            btnCancelAll = Btn("Cancel all", 0);
+            btnOpen2 = Btn("Open download folder", 0);
+            top.Controls.Add(btnRetry, 2, 0);
+            top.Controls.Add(btnClear, 3, 0);
+            top.Controls.Add(btnCancelAll, 4, 0);
+            top.Controls.Add(btnOpen2, 5, 0);
+            t.Controls.Add(top, 0, 0);
+
+            bar = new ThinBar();
+            bar.Dock = DockStyle.Fill; bar.Margin = new Padding(0, Px(2), 0, Px(2));
+            bar.Fill = cAccent; bar.Track = cTrack;
+            t.Controls.Add(bar, 0, 1);
+
+            lvQueue = NewList();
+            lvQueue.MultiSelect = true;
+            lvQueue.Columns.Add("Patient", Px(150));
+            lvQueue.Columns.Add("Modality", Px(86));
+            lvQueue.Columns.Add("Series", Px(250));
+            lvQueue.Columns.Add("Images", Px(62), HorizontalAlignment.Right);
+            lvQueue.Columns.Add("Size", Px(72), HorizontalAlignment.Right);
+            lvQueue.Columns.Add("Status", Px(240));
+            lvQueue.Columns.Add("Saved to", Px(400));
+            t.Controls.Add(Framed(lvQueue), 0, 2);
+            return t;
+        }
+
+        void AutoFit(ListView lv, int fillCol, int minW)
+        {
+            if (lv.Columns.Count <= fillCol) return;
+            int other = 0;
+            for (int i = 0; i < lv.Columns.Count; i++) if (i != fillCol) other += lv.Columns[i].Width;
+            int w = lv.ClientSize.Width - other - 1;
+            if (!Native.HasVScroll(lv)) w -= SystemInformation.VerticalScrollBarWidth;   // leave room for it to appear
+            lv.Columns[fillCol].Width = Math.Max(Px(minW), w);
+        }
+
+        // ============================================================ events
+
+        void WireEvents()
+        {
+            uiTimer = new System.Windows.Forms.Timer(); uiTimer.Interval = 400;
+            uiTimer.Tick += (s, e) => UiTick();
+            collFilterTimer = new System.Windows.Forms.Timer(); collFilterTimer.Interval = 180;
+            collFilterTimer.Tick += (s, e) => { collFilterTimer.Stop(); ApplyCollectionFilter(); };
+            patFilterTimer = new System.Windows.Forms.Timer(); patFilterTimer.Interval = 180;
+            patFilterTimer.Tick += (s, e) => { patFilterTimer.Stop(); ApplyPatientFilter(); };
+            patSelectTimer = new System.Windows.Forms.Timer(); patSelectTimer.Interval = 220;
+            patSelectTimer.Tick += (s, e) => { patSelectTimer.Stop(); OnPatientSelectionSettled(); };
+
+            btnChange.Click += (s, e) => ChangeFolder();
+            btnOpen.Click += (s, e) => OpenFolder(saveRoot);
+            btnOpen2.Click += (s, e) => OpenFolder(saveRoot);
+            btnFind.Click += (s, e) => FindPatient();
+            tbFind.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; FindPatient(); } };
+            btnManifest.Click += (s, e) => PickManifest();
+            btnRefresh.Click += async (s, e) => await LoadCatalog(true);
+
+            tbCollFilter.TextChanged += (s, e) => { collFilterTimer.Stop(); collFilterTimer.Start(); };
+            cbModality.SelectedIndexChanged += (s, e) => { if (!suppressMod) OnModalityChanged(); };
+            lvColl.SelectedIndexChanged += (s, e) => OnCollectionSelected();
+            lvColl.ColumnClick += (s, e) =>
+            {
+                if (sortCol == e.Column) sortAsc = !sortAsc; else { sortCol = e.Column; sortAsc = e.Column != 2; }
+                ApplyCollectionFilter();
+            };
+            lvColl.Resize += (s, e) => AutoFit(lvColl, 3, 90);
+            lnkColl.LinkClicked += (s, e) =>
+            {
+                if (curCollection == null || curCollection.Link == "") return;
+                try { Process.Start(curCollection.Link); } catch (Exception ex) { SetStatus("Couldn't open the browser: " + ex.Message, true); }
+            };
+
+            tbPatFilter.TextChanged += (s, e) => { patFilterTimer.Stop(); patFilterTimer.Start(); };
+            lvPat.RetrieveVirtualItem += (s, e) =>
+            {
+                string id = e.ItemIndex >= 0 && e.ItemIndex < patientsShown.Count ? patientsShown[e.ItemIndex] : "";
+                e.Item = new ListViewItem(id);
+            };
+            EventHandler patSel = (s, e) => { UpdatePatientButtons(); patSelectTimer.Stop(); patSelectTimer.Start(); };
+            lvPat.SelectedIndexChanged += patSel;
+            lvPat.VirtualItemsSelectionRangeChanged += (s, e) => patSel(s, e);
+            lvPat.KeyDown += (s, e) => { if (e.Control && e.KeyCode == Keys.A) { e.SuppressKeyPress = true; SelectAllPatients(); } };
+            lvPat.Resize += (s, e) => AutoFit(lvPat, 0, 80);
+            btnPatAll.Click += (s, e) => SelectAllPatients();
+            btnPatDownload.Click += (s, e) => DownloadSelectedPatients();
+
+            lvSeries.ItemChecked += (s, e) => { if (!suppressCheck) UpdateSeriesSummary(); };
+            lvSeries.Resize += (s, e) => AutoFit(lvSeries, 1, 120);
+            btnCheckAll.Click += (s, e) => SetAllChecks(true);
+            btnCheckNone.Click += (s, e) => SetAllChecks(false);
+            btnDownload.Click += (s, e) => DownloadChecked();
+
+            btnRetry.Click += (s, e) => RetryItems(null);
+            btnClear.Click += (s, e) => ClearFinished();
+            btnCancelAll.Click += (s, e) => CancelAll(true);
+            lvQueue.DoubleClick += (s, e) => { var l = SelectedQueueItems(); if (l.Count > 0) OpenFolder(l[0].Folder); };
+            lvQueue.Resize += (s, e) => AutoFit(lvQueue, 6, 200);
+            BuildQueueMenu();
+
+            DragEnter += (s, e) => { if (e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; };
+            DragDrop += (s, e) =>
+            {
+                var files = e.Data.GetData(DataFormats.FileDrop) as string[];
+                if (files == null) return;
+                foreach (var f in files) LoadManifest(f);
+            };
+
+            tips.SetToolTip(btnFind, "Looks up an exact patient ID across all public collections");
+            tips.SetToolTip(btnManifest, "Open a .tcia manifest you downloaded from the TCIA website and download every series in it");
+            tips.SetToolTip(btnRefresh, "Download the latest list of collections from TCIA");
+            tips.SetToolTip(btnChange, "Choose where downloaded DICOM files are saved");
+            tips.SetToolTip(cbModality, "Only show collections, patients and series with this kind of scan");
+            tips.SetToolTip(btnPatDownload, "Download every series for the selected patient(s). Use the modality box to limit it to one kind of scan.");
+            tips.SetToolTip(lvQueue, "Double-click a row to open its folder. Right-click for more options.");
+        }
+
+        protected override async void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            Try(() => { splitMain.Panel1MinSize = Px(280); splitMain.Panel2MinSize = Px(140); });
+            Try(() => splitMain.SplitterDistance = Math.Max(Px(280), splitMain.Height - Px(205)));
+            Try(() => { splitA.Panel1MinSize = Px(330); splitA.Panel2MinSize = Px(460); });
+            Try(() => splitA.SplitterDistance = Px(520));
+            Try(() => { splitB.Panel1MinSize = Px(170); splitB.Panel2MinSize = Px(300); });
+            Try(() => splitB.SplitterDistance = Px(220));
+            AutoFit(lvColl, 3, 90); AutoFit(lvPat, 0, 80); AutoFit(lvSeries, 1, 120); AutoFit(lvQueue, 6, 200);
+            try { taskbar = (ITaskbarList3)new TaskbarInstance(); taskbar.HrInit(); } catch (Exception) { taskbar = null; }
+            Util.TryDeleteDir(Path.Combine(saveRoot, ".partial"));
+            uiTimer.Start();
+            UiTick();
+            foreach (var a in startArgs) if (File.Exists(a)) LoadManifest(a);
+            await LoadCatalog(false);
+        }
+
+        static void Try(Action a) { try { a(); } catch (Exception) { } }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            bool busy;
+            lock (qlock) busy = queue.Any(q => q.State == QState.Active || q.State == QState.Pending);
+            if (busy && e.CloseReason == CloseReason.UserClosing)
+            {
+                var r = MessageBox.Show(this,
+                    "Downloads are still running. Stop them and quit?\n\nSeries that already finished stay on your computer. Unfinished ones can be downloaded again later.",
+                    "Quit TCIA Downloader", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                if (r != DialogResult.Yes) { e.Cancel = true; return; }
+            }
+            runCts.Cancel();
+            if (sleepBlocked) Native.SetThreadExecutionState(0x80000000);
+            base.OnFormClosing(e);
+        }
+
+        void SetStatus(string msg, bool error = false)
+        {
+            lblStatus.Text = msg;
+            lblStatus.ForeColor = error ? cRed : cMuted;
+        }
+
+        string SelectedModality()
+        {
+            var m = cbModality.SelectedItem as ModItem;
+            return m == null ? null : m.Code;
+        }
+
+        static string Esc(string s) { return Uri.EscapeDataString(s ?? ""); }
+
+        // ============================================================ settings & catalog cache
+
+        void LoadSettings()
+        {
+            saveRoot = Path.Combine(Native.Downloads(), "TCIA");
+            try
+            {
+                string f = Path.Combine(appDir, "settings.txt");
+                if (File.Exists(f))
+                    foreach (var line in File.ReadAllLines(f))
+                        if (line.StartsWith("saveRoot=") && line.Substring(9).Trim() != "") saveRoot = line.Substring(9).Trim();
+            }
+            catch (Exception) { }
+        }
+
+        void SaveSettings()
+        {
+            try { Directory.CreateDirectory(appDir); File.WriteAllText(Path.Combine(appDir, "settings.txt"), "saveRoot=" + saveRoot + "\r\n"); }
+            catch (Exception) { }
+        }
+
+        void UpdateSavePathLabel()
+        {
+            lblSavePath.Text = Util.ShortPath(saveRoot, 48);
+            tips.SetToolTip(lblSavePath, saveRoot);
+        }
+
+        string CacheFile { get { return Path.Combine(appDir, "catalog.json"); } }
+        const string CacheVersion = "2";
+
+        bool LoadCache(out DateTime savedUtc)
+        {
+            savedUtc = DateTime.MinValue;
+            try
+            {
+                if (!File.Exists(CacheFile)) return false;
+                var ser = new JavaScriptSerializer(); ser.MaxJsonLength = int.MaxValue;
+                var root = ser.DeserializeObject(File.ReadAllText(CacheFile, Encoding.UTF8)) as Dictionary<string, object>;
+                if (root == null || !root.ContainsKey("collections") || J.S(root, "v") != CacheVersion) return false;
+                DateTime.TryParse(J.S(root, "saved"), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out savedUtc);
+                webLoaded = J.S(root, "web") == "True";
+                var list = new List<CollectionInfo>();
+                foreach (var o in (IEnumerable)root["collections"])
+                {
+                    var d = o as Dictionary<string, object>;
+                    if (d == null) continue;
+                    var c = new CollectionInfo();
+                    c.Name = J.S(d, "name");
+                    if (c.Name == "") continue;
+                    c.Title = J.S(d, "title"); c.CancerTypes = J.S(d, "cancer"); c.Locations = J.S(d, "loc");
+                    c.Subjects = J.S(d, "subjects"); c.Species = J.S(d, "species"); c.Link = J.S(d, "link");
+                    c.Abstract = J.S(d, "abstract"); c.Doi = J.S(d, "doi");
+                    object mods;
+                    if (d.TryGetValue("mods", out mods) && mods is IEnumerable && !(mods is string))
+                    {
+                        c.Modalities = ((IEnumerable)mods).Cast<object>().Select(x => Convert.ToString(x)).Where(x => !string.IsNullOrEmpty(x)).ToList();
+                        c.ModalitiesLoaded = true;
+                    }
+                    c.UpdateSearch();
+                    list.Add(c);
+                }
+                if (list.Count == 0) return false;
+                collections = list;
+                return true;
+            }
+            catch (Exception) { return false; }
+        }
+
+        void SaveCache()
+        {
+            try
+            {
+                var list = collections.Select(c => (object)new Dictionary<string, object> {
+                    { "name", c.Name }, { "title", c.Title }, { "cancer", c.CancerTypes }, { "loc", c.Locations },
+                    { "subjects", c.Subjects }, { "species", c.Species }, { "link", c.Link }, { "abstract", c.Abstract },
+                    { "doi", c.Doi }, { "mods", c.ModalitiesLoaded ? (object)c.Modalities.ToArray() : null } }).ToArray();
+                var root = new Dictionary<string, object> { { "v", CacheVersion }, { "saved", DateTime.UtcNow.ToString("o") }, { "web", webLoaded }, { "collections", list } };
+                var ser = new JavaScriptSerializer(); ser.MaxJsonLength = int.MaxValue;
+                Directory.CreateDirectory(appDir);
+                string tmp = CacheFile + ".tmp";
+                File.WriteAllText(tmp, ser.Serialize(root), Encoding.UTF8);
+                if (File.Exists(CacheFile)) File.Delete(CacheFile);
+                File.Move(tmp, CacheFile);
+            }
+            catch (Exception) { }
+        }
+
+        async Task LoadCatalog(bool force)
+        {
+            if (catalogBusy) return;
+            catalogBusy = true;
+            btnRefresh.Enabled = false;
+            try
+            {
+                DateTime saved;
+                if (!force && collections.Count == 0 && LoadCache(out saved))
+                {
+                    BuildModalityCombo();
+                    ApplyCollectionFilter();
+                    bool fresh = (DateTime.UtcNow - saved).TotalDays < 7 && webLoaded && collections.All(c => c.ModalitiesLoaded);
+                    SetStatus("Ready · " + collections.Count + " public collections.");
+                    if (fresh) return;
+                }
+
+                SetStatus(collections.Count > 0 ? "Checking TCIA for catalog updates…" : "Connecting to The Cancer Imaging Archive…");
+                lblCollInfo.Text = collections.Count > 0 ? lblCollInfo.Text : "Loading the list of collections…";
+                var tWeb = Tcia.GetWebCollections(CancellationToken.None);
+                List<Dictionary<string, object>> nb;
+                try { nb = await Tcia.GetList("getCollectionValues", CancellationToken.None); }
+                catch (Exception ex)
+                {
+                    SetStatus("Couldn't reach TCIA (" + Util.Inner(ex) + "). Check your internet connection, then click Refresh catalog.", true);
+                    if (collections.Count == 0) lblCollInfo.Text = "Not connected to TCIA";
+                    return;
+                }
+
+                var old = new Dictionary<string, CollectionInfo>(StringComparer.OrdinalIgnoreCase);
+                foreach (var c in collections) old[c.Name] = c;
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var list = new List<CollectionInfo>();
+                foreach (var r in nb)
+                {
+                    string n = J.S(r, "Collection");
+                    if (n == "" || !seen.Add(n)) continue;
+                    CollectionInfo c;
+                    if (!old.TryGetValue(n, out c)) { c = new CollectionInfo(); c.Name = n; }
+                    if (force) c.ModalitiesLoaded = false;
+                    c.UpdateSearch();
+                    list.Add(c);
+                }
+                collections = list;
+                ApplyCollectionFilter();
+
+                try { MergeWeb(await tWeb); webLoaded = true; }
+                catch (Exception) { /* descriptions are optional */ }
+                ApplyCollectionFilter();
+                if (curCollection != null) ShowCollectionDetails(curCollection);
+                SaveCache();
+
+                await IndexModalities();
+                SaveCache();
+                BuildModalityCombo();
+                ApplyCollectionFilter();
+                SetStatus("Ready · " + collections.Count + " public collections.");
+            }
+            finally
+            {
+                catalogBusy = false;
+                btnRefresh.Enabled = true;
+            }
+        }
+
+        void MergeWeb(List<Dictionary<string, object>> web)
+        {
+            var map = new Dictionary<string, Dictionary<string, object>>();
+            foreach (var r in web)
+                foreach (var key in new[] { J.S(r, "collection_short_title"), J.S(r, "title"), J.S(r, "slug") })
+                {
+                    string k = Util.Norm(WebUtility.HtmlDecode(key));
+                    if (k != "" && !map.ContainsKey(k)) map[k] = r;
+                }
+            foreach (var c in collections)
+            {
+                Dictionary<string, object> r;
+                if (!map.TryGetValue(Util.Norm(c.Name), out r)) continue;
+                string title = WebUtility.HtmlDecode(J.S(r, "collection_title"));
+                if (title == "") title = WebUtility.HtmlDecode(J.S(r, "title"));
+                c.Title = title;
+                c.CancerTypes = J.S(r, "cancer_types");
+                c.Locations = J.S(r, "cancer_locations");
+                c.Subjects = J.S(r, "subjects");
+                c.Species = J.S(r, "species");
+                c.Link = J.S(r, "link");
+                c.Doi = J.S(r, "collection_doi");
+                string text = "";
+                foreach (var f in new[] { "collection_abstract", "collection_summary", "collection_introduction" })
+                {
+                    text = Util.StripHtml(J.S(r, f));
+                    if (text != "") break;
+                }
+                c.Abstract = text;
+                c.UpdateSearch();
+            }
+        }
+
+        async Task IndexModalities()
+        {
+            var todo = collections.Where(c => !c.ModalitiesLoaded).ToList();
+            if (todo.Count == 0) return;
+            indexing = true; indexDone = 0; indexTotal = todo.Count;
+            UpdateCollInfoLabel();
+            var sem = new SemaphoreSlim(8);
+            var tasks = todo.Select(async c =>
+            {
+                await sem.WaitAsync();
+                try
+                {
+                    var rows = await Tcia.GetList("getModalityValues?Collection=" + Esc(c.Name), CancellationToken.None);
+                    c.Modalities = Util.SortModalities(rows.Select(r => J.S(r, "Modality")).Where(m => m != ""));
+                    c.ModalitiesLoaded = true;
+                    c.UpdateSearch();
+                    foreach (ListViewItem it in lvColl.Items)
+                        if (it.Tag == c) { it.SubItems[3].Text = c.ModText; break; }
+                }
+                catch (Exception) { }
+                finally
+                {
+                    sem.Release();
+                    indexDone++;
+                    UpdateCollInfoLabel();
+                }
+            }).ToList();
+            await Task.WhenAll(tasks);
+            indexing = false;
+            UpdateCollInfoLabel();
+        }
+
+        void BuildModalityCombo()
+        {
+            string cur = SelectedModality();
+            var counts = new Dictionary<string, int>();
+            foreach (var c in collections)
+                foreach (var m in c.Modalities) { int n; counts.TryGetValue(m, out n); counts[m] = n + 1; }
+            suppressMod = true;
+            cbModality.BeginUpdate();
+            try
+            {
+                cbModality.Items.Clear();
+                cbModality.Items.Add(new ModItem(null, "All modalities", 0));
+                int sel = 0;
+                foreach (var m in Util.SortModalities(counts.Keys))
+                {
+                    cbModality.Items.Add(new ModItem(m, Util.ModalityLabel(m), counts[m]));
+                    if (m == cur) sel = cbModality.Items.Count - 1;
+                }
+                cbModality.SelectedIndex = sel;
+            }
+            finally { cbModality.EndUpdate(); suppressMod = false; }
+            int w = cbModality.Width;
+            foreach (var o in cbModality.Items) w = Math.Max(w, TextRenderer.MeasureText(o.ToString(), cbModality.Font).Width + Px(28));
+            cbModality.DropDownWidth = w;
+        }
+
+        // ============================================================ collections
+
+        void ApplyCollectionFilter()
+        {
+            string raw = tbCollFilter.Text.Trim().ToLowerInvariant();
+            string[] terms = Regex.Split(raw, "[^a-z0-9]+").Where(x => x != "").ToArray();
+            string mod = SelectedModality();
+            var shown = collections.Where(c => c.Matches(terms, raw) && (mod == null || c.Modalities.Contains(mod))).ToList();
+            Comparison<CollectionInfo> cmp;
+            switch (sortCol)
+            {
+                case 1: cmp = (a, b) => CompareText(a.TypeText, b.TypeText); break;
+                case 2: cmp = (a, b) => a.SubjectsNum.CompareTo(b.SubjectsNum); break;
+                case 3: cmp = (a, b) => CompareText(a.ModText, b.ModText); break;
+                default: cmp = (a, b) => Native.StrCmpLogicalW(a.Name, b.Name); break;
+            }
+            shown.Sort((a, b) => { int r = cmp(a, b); if (r == 0) r = Native.StrCmpLogicalW(a.Name, b.Name); return sortAsc ? r : -r; });
+
+            suppressColl = true;
+            lvColl.BeginUpdate();
+            try
+            {
+                lvColl.Items.Clear();
+                foreach (var c in shown)
+                {
+                    var it = new ListViewItem(new string[] { c.Name, c.TypeText, c.SubjectsText, c.ModText });
+                    it.Tag = c;
+                    lvColl.Items.Add(it);
+                    if (c == curCollection) { it.Selected = true; it.Focused = true; }
+                }
+            }
+            finally { lvColl.EndUpdate(); suppressColl = false; }
+            lastShownCount = shown.Count;
+            UpdateCollInfoLabel();
+        }
+
+        static int CompareText(string a, string b)
+        {
+            if (a == "" && b != "") return 1;
+            if (b == "" && a != "") return -1;
+            return string.Compare(a, b, StringComparison.OrdinalIgnoreCase);
+        }
+
+        void UpdateCollInfoLabel()
+        {
+            if (collections.Count == 0) { if (lblCollInfo.Text == "") lblCollInfo.Text = "Loading the list of collections…"; return; }
+            string s = lastShownCount == collections.Count
+                ? collections.Count + " public collections"
+                : lastShownCount + " of " + collections.Count + " public collections match";
+            if (indexing) s += "   ·   reading scan types " + indexDone + "/" + indexTotal + "…";
+            else s += "   ·   click a column to sort";
+            lblCollInfo.Text = s;
+        }
+
+        void OnModalityChanged()
+        {
+            ApplyCollectionFilter();
+            if (curCollection != null) { var _ = LoadPatients(); }
+            UpdatePatientButtons();
+        }
+
+        void OnCollectionSelected()
+        {
+            if (suppressColl || lvColl.SelectedItems.Count != 1) return;
+            var c = lvColl.SelectedItems[0].Tag as CollectionInfo;
+            if (c == null) return;
+            if (c == curCollection) { TrySelectPendingPatient(); return; }
+            curCollection = c;
+            ShowCollectionDetails(c);
+            var _ = LoadPatients();
+        }
+
+        void ShowCollectionDetails(CollectionInfo c)
+        {
+            if (c == null)
+            {
+                lblCollTitle.Text = "Find the scans you need";
+                lblCollMeta.Text = "Public collections from The Cancer Imaging Archive";
+                tbAbstract.Text =
+                    "Search above by cancer type (breast, lung, brain), body site (prostate, head) or scan type " +
+                    "(CT, MR, PT, RTSTRUCT, RTDOSE). Pick a collection to list its patients, tick the series you want, " +
+                    "then click Download.\r\n\r\nFiles are saved as standard .dcm files that open in any DICOM viewer or " +
+                    "planning system.\r\n\r\nLimited-access collections (for example HNSCC) need a TCIA account and aren't listed here.";
+                lnkColl.Visible = false;
+                return;
+            }
+            lblCollTitle.Text = c.Title != "" && Util.Norm(c.Title) != Util.Norm(c.Name) ? c.Name + "  —  " + c.Title : c.Name;
+            string loc = c.Locations != "" && c.Locations != c.CancerTypes ? c.Locations : "";
+            lblCollMeta.Text = Util.JoinNonEmpty("   ·   ", c.CancerTypes, loc,
+                c.SubjectsText != "" ? c.SubjectsText + " subjects" : "", c.ModalitiesLoaded ? c.ModText : "");
+            tbAbstract.Text = c.Abstract != "" ? c.Abstract : "No description available for this collection.";
+            lnkColl.Visible = c.Link != "";
+        }
+
+        // ============================================================ patients
+
+        async Task LoadPatients()
+        {
+            var c = curCollection;
+            if (c == null) return;
+            string mod = SelectedModality();
+            string key = c.Name + "|" + (mod ?? "*");
+            int token = ++patToken;
+            hdrPat.Text = mod == null ? "Patients in " + c.Name : "Patients with " + mod;
+            patientsAll = new List<string>();
+            ApplyPatientFilter();
+            lblPatCount.Text = "Loading patients…";
+            ClearSeries("Select a patient to see their scans.");
+
+            List<string> list;
+            if (!patientCache.TryGetValue(key, out list))
+            {
+                SetStatus("Loading patients in " + c.Name + "…");
+                try
+                {
+                    string q = mod == null
+                        ? "getPatient?Collection=" + Esc(c.Name)
+                        : "getPatientByCollectionAndModality?Collection=" + Esc(c.Name) + "&Modality=" + Esc(mod);
+                    var rows = await Tcia.GetList(q, CancellationToken.None);
+                    list = rows.Select(r => { string id = J.S(r, "PatientId"); return id != "" ? id : J.S(r, "PatientID"); })
+                        .Where(x => x != "").Distinct().ToList();
+                    list.Sort((a, b) => Native.StrCmpLogicalW(a, b));
+                    patientCache[key] = list;
+                }
+                catch (Exception ex)
+                {
+                    if (token == patToken)
+                    {
+                        lblPatCount.Text = "Couldn't load patients";
+                        SetStatus("Couldn't load patients: " + Util.Inner(ex), true);
+                    }
+                    return;
+                }
+            }
+            if (token != patToken) return;
+            patientsAll = list;
+            ApplyPatientFilter();
+            SetStatus(list.Count.ToString("N0") + " patients in " + c.Name + (mod != null ? " with " + mod + " scans" : "") + ".");
+            if (list.Count == 0 && mod != null) lblPatCount.Text = "No patients with " + mod + " in this collection";
+            TrySelectPendingPatient();
+        }
+
+        void ApplyPatientFilter()
+        {
+            string f = tbPatFilter.Text.Trim();
+            patientsShown = f == "" ? patientsAll : patientsAll.Where(p => p.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0).ToList();
+            lvPat.SelectedIndices.Clear();
+            lvPat.VirtualListSize = patientsShown.Count;
+            lvPat.Invalidate();
+            if (curCollection != null)
+                lblPatCount.Text = patientsShown.Count == patientsAll.Count
+                    ? patientsAll.Count.ToString("N0") + " patients · Ctrl/Shift-click to pick several"
+                    : patientsShown.Count.ToString("N0") + " of " + patientsAll.Count.ToString("N0") + " patients";
+            UpdatePatientButtons();
+        }
+
+        void TrySelectPendingPatient()
+        {
+            if (pendingPatient == null || patientsAll.Count == 0) return;
+            string want = pendingPatient;
+            pendingPatient = null;
+            if (tbPatFilter.Text != "")
+            {
+                tbPatFilter.Text = "";
+                patFilterTimer.Stop();
+                ApplyPatientFilter();
+            }
+            int idx = patientsShown.FindIndex(p => string.Equals(p, want, StringComparison.OrdinalIgnoreCase));
+            if (idx < 0) return;
+            lvPat.SelectedIndices.Clear();
+            lvPat.SelectedIndices.Add(idx);
+            lvPat.EnsureVisible(idx);
+            lvPat.FocusedItem = lvPat.Items[idx];
+            lvPat.Focus();
+        }
+
+        void SelectAllPatients()
+        {
+            if (patientsShown.Count == 0) return;
+            Native.SelectAll(lvPat);
+            lvPat.Focus();
+            UpdatePatientButtons();
+            patSelectTimer.Stop(); patSelectTimer.Start();
+        }
+
+        void UpdatePatientButtons()
+        {
+            if (btnPatDownload == null) return;
+            int n = lvPat.SelectedIndices.Count;
+            string mod = SelectedModality();
+            string what = mod == null ? "" : " (" + mod + ")";
+            btnPatDownload.Enabled = n > 0 && curCollection != null;
+            btnPatDownload.Text = (n <= 1 ? "Download patient" : "Download " + n.ToString("N0") + " patients") + what;
+            btnPatAll.Enabled = patientsShown.Count > 0;
+        }
+
+        void OnPatientSelectionSettled()
+        {
+            int n = lvPat.SelectedIndices.Count;
+            if (n == 1)
+            {
+                int i = lvPat.SelectedIndices[0];
+                if (i < 0 || i >= patientsShown.Count) return;
+                string pid = patientsShown[i];
+                if (pid != curPatient || curSeries.Count == 0) { var _ = LoadSeries(pid); }
+            }
+            else if (n > 1)
+            {
+                ClearSeries(n.ToString("N0") + " patients selected. Click “Download " + n.ToString("N0") +
+                    " patients” on the left to get all their scans, or pick one patient to choose individual series.");
+            }
+        }
+
+        async void DownloadSelectedPatients()
+        {
+            var c = curCollection;
+            if (c == null) return;
+            var pids = lvPat.SelectedIndices.Cast<int>().Where(i => i >= 0 && i < patientsShown.Count).Select(i => patientsShown[i]).ToList();
+            if (pids.Count == 0) return;
+            string mod = SelectedModality();
+            if (pids.Count > 10)
+            {
+                var r = MessageBox.Show(this,
+                    "Download " + (mod == null ? "every series" : "every " + mod + " series") + " for " + pids.Count.ToString("N0") +
+                    " patients in " + c.Name + "?\n\nThis can be a lot of data. Each patient's scans are added to the download list " +
+                    "as they're found, and you can cancel at any time.",
+                    "Download " + pids.Count.ToString("N0") + " patients", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (r != DialogResult.Yes) return;
+            }
+            btnPatDownload.Enabled = false;
+            int done = 0, added = 0, failed = 0;
+            long bytes = 0;
+            var sem = new SemaphoreSlim(4);
+            var tasks = pids.Select(async pid =>
+            {
+                await sem.WaitAsync();
+                try
+                {
+                    var list = await GetPatientSeries(c.Name, pid);
+                    var sel = list.Where(s => mod == null || s.Modality == mod).ToList();
+                    added += Enqueue(sel);
+                    bytes += sel.Sum(s => s.FileSize);
+                }
+                catch (Exception) { failed++; }
+                finally
+                {
+                    sem.Release();
+                    done++;
+                    if (pids.Count > 1) SetStatus("Adding patients to Downloads… " + done + " of " + pids.Count);
+                }
+            }).ToList();
+            await Task.WhenAll(tasks);
+            UpdatePatientButtons();
+            if (curPatient != null && pids.Contains(curPatient) && curSeries.Count > 0) FillSeries();
+            SetStatus("Added " + added + " series" + (bytes > 0 ? " (" + Util.Size(bytes) + ")" : "") + " from " + pids.Count +
+                (pids.Count == 1 ? " patient" : " patients") + " to Downloads" +
+                (failed > 0 ? "; " + failed + " patient(s) couldn't be read - try again" : "") + ".", failed > 0);
+        }
+
+        // ============================================================ series
+
+        async Task<List<SeriesInfo>> GetPatientSeries(string coll, string pid)
+        {
+            string key = coll + "|" + pid;
+            List<SeriesInfo> list;
+            if (seriesCache.TryGetValue(key, out list)) return list;
+            var tSeries = Tcia.GetList("getSeries?Collection=" + Esc(coll) + "&PatientID=" + Esc(pid), CancellationToken.None);
+            var tStudies = Tcia.GetList("getPatientStudy?Collection=" + Esc(coll) + "&PatientID=" + Esc(pid), CancellationToken.None);
+            var rows = await tSeries;
+            var studies = new Dictionary<string, Dictionary<string, object>>();
+            try
+            {
+                foreach (var r in await tStudies)
+                {
+                    string u = J.S(r, "StudyInstanceUID");
+                    if (u != "") studies[u] = r;
+                }
+            }
+            catch (Exception) { }
+            list = rows.Select(SeriesInfo.From).Where(s => s.SeriesUID != "").ToList();
+            foreach (var s in list)
+            {
+                Dictionary<string, object> st;
+                if (!studies.TryGetValue(s.StudyUID, out st)) continue;
+                if (s.StudyDesc == "") s.StudyDesc = J.S(st, "StudyDescription");
+                if (s.StudyDate == "") s.StudyDate = Util.DateOnly(J.S(st, "StudyDate"));
+            }
+            list.Sort(SeriesInfo.Compare);
+            seriesCache[key] = list;
+            return list;
+        }
+
+        async Task LoadSeries(string pid)
+        {
+            var c = curCollection;
+            if (c == null) return;
+            int token = ++seriesToken;
+            curPatient = pid;
+            curSeries = new List<SeriesInfo>();
+            hdrSeries.Text = "Series for " + pid;
+            suppressCheck = true;
+            lvSeries.Items.Clear(); lvSeries.Groups.Clear(); seriesRows.Clear();
+            suppressCheck = false;
+            lblSeriesSum.Text = "Loading series…";
+            btnDownload.Enabled = false;
+            List<SeriesInfo> list;
+            try { list = await GetPatientSeries(c.Name, pid); }
+            catch (Exception ex)
+            {
+                if (token == seriesToken) lblSeriesSum.Text = "Couldn't load series: " + Util.Inner(ex);
+                return;
+            }
+            if (token != seriesToken) return;
+            curSeries = list;
+            FillSeries();
+        }
+
+        bool InQueue(SeriesInfo s)
+        {
+            QueueItem q;
+            return byUid.TryGetValue(s.SeriesUID, out q) && (q.State == QState.Pending || q.State == QState.Active);
+        }
+
+        void FillSeries()
+        {
+            string mod = SelectedModality();
+            suppressCheck = true;
+            lvSeries.BeginUpdate();
+            try
+            {
+                lvSeries.Items.Clear(); lvSeries.Groups.Clear(); seriesRows.Clear();
+                var groups = new Dictionary<string, ListViewGroup>();
+                foreach (var g in curSeries.GroupBy(s => s.StudyUID))
+                {
+                    var first = g.First();
+                    int n = g.Count();
+                    string head = Util.JoinNonEmpty("   ·   ", first.StudyDate == "" ? "Unknown date" : first.StudyDate,
+                        first.StudyDesc, n + " series", Util.Size(g.Sum(s => s.FileSize)));
+                    var grp = new ListViewGroup(g.Key, head);
+                    lvSeries.Groups.Add(grp);
+                    groups[g.Key] = grp;
+                }
+                foreach (var s in curSeries)
+                {
+                    bool onDisk = Util.IsComplete(Downloader.SeriesFolder(saveRoot, s), s.ImageCount);
+                    bool queued = InQueue(s);
+                    var it = new ListViewItem(new string[] {
+                        s.Modality, Util.SeriesLabel(s), s.SeriesNumber,
+                        s.ImageCount > 0 ? s.ImageCount.ToString("N0") : "", Util.Size(s.FileSize),
+                        onDisk ? StSaved : queued ? StQueued : "" });
+                    it.Tag = s;
+                    it.Group = groups[s.StudyUID];
+                    it.Checked = !onDisk && !queued && (mod == null || s.Modality == mod);
+                    if (onDisk) it.ForeColor = cGreen;
+                    lvSeries.Items.Add(it);
+                    seriesRows[s.SeriesUID] = it;
+                }
+            }
+            finally { lvSeries.EndUpdate(); suppressCheck = false; }
+            AutoFit(lvSeries, 1, 120);
+            UpdateSeriesSummary();
+        }
+
+        void ClearSeries(string msg)
+        {
+            seriesToken++;
+            curPatient = null;
+            curSeries = new List<SeriesInfo>();
+            suppressCheck = true;
+            lvSeries.Items.Clear(); lvSeries.Groups.Clear(); seriesRows.Clear();
+            suppressCheck = false;
+            hdrSeries.Text = "Series";
+            lblSeriesSum.Text = msg;
+            btnDownload.Enabled = false;
+            btnDownload.Text = "Download ticked series";
+        }
+
+        void UpdateSeriesSummary()
+        {
+            if (curSeries.Count == 0) return;
+            int n = 0, imgs = 0;
+            long bytes = 0;
+            foreach (ListViewItem it in lvSeries.Items)
+                if (it.Checked) { var s = (SeriesInfo)it.Tag; n++; bytes += s.FileSize; imgs += s.ImageCount; }
+            int saved = lvSeries.Items.Cast<ListViewItem>().Count(i => i.SubItems[5].Text == StSaved);
+            lblSeriesSum.Text = n + " of " + curSeries.Count + " series ticked" +
+                (n > 0 ? "  ·  " + imgs.ToString("N0") + " images" : "") +
+                (saved > 0 ? "\r\n" + saved + " already saved on this computer" : "");
+            btnDownload.Enabled = n > 0;
+            btnDownload.Text = n > 0
+                ? "Download " + n + " series" + (bytes > 0 ? "  (" + Util.Size(bytes) + ")" : "")
+                : "Download ticked series";
+        }
+
+        void SetAllChecks(bool v)
+        {
+            suppressCheck = true;
+            foreach (ListViewItem it in lvSeries.Items) it.Checked = v;
+            suppressCheck = false;
+            UpdateSeriesSummary();
+        }
+
+        void DownloadChecked()
+        {
+            var list = lvSeries.Items.Cast<ListViewItem>().Where(i => i.Checked).Select(i => (SeriesInfo)i.Tag).ToList();
+            if (list.Count == 0) return;
+            int added = Enqueue(list);
+            suppressCheck = true;
+            foreach (ListViewItem it in lvSeries.Items)
+                if (it.Checked) { it.Checked = false; if (it.SubItems[5].Text == "") it.SubItems[5].Text = StQueued; }
+            suppressCheck = false;
+            UpdateSeriesSummary();
+            SetStatus(added > 0 ? "Added " + added + " series to Downloads. Saving to " + saveRoot : "Those series are already in the download list.");
+        }
+
+        // ============================================================ find patient & manifests
+
+        async void FindPatient()
+        {
+            string id = tbFind.Text.Trim();
+            if (id == "") { tbFind.Focus(); return; }
+            btnFind.Enabled = false;
+            SetStatus("Looking for patient “" + id + "” in all public collections…");
+            try
+            {
+                var rows = await Tcia.GetList("getSeries?PatientID=" + Esc(id), CancellationToken.None);
+                if (rows.Count == 0)
+                {
+                    SetStatus("No public scans found for patient ID “" + id + "”.", true);
+                    MessageBox.Show(this,
+                        "No public scans were found for patient ID “" + id + "”.\n\nThe ID must match exactly (for example LUNG1-001 or PANCREAS_0001). " +
+                        "To search by part of an ID, pick a collection first and type in its patient filter box.",
+                        "Patient not found", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                var colls = rows.Select(r => J.S(r, "Collection")).Where(x => x != "").Distinct().ToList();
+                string pid = J.S(rows[0], "PatientID");
+                if (pid == "") pid = id;
+                string coll = colls.Count > 0 ? colls[0] : "";
+                var target = collections.FirstOrDefault(c => string.Equals(c.Name, coll, StringComparison.OrdinalIgnoreCase));
+                if (target == null)
+                {
+                    target = new CollectionInfo(); target.Name = coll; target.UpdateSearch();
+                    collections.Add(target);
+                }
+                pendingPatient = pid;
+                if (tbCollFilter.Text != "") { tbCollFilter.Text = ""; collFilterTimer.Stop(); }
+                if (cbModality.SelectedIndex != 0) { suppressMod = true; cbModality.SelectedIndex = 0; suppressMod = false; }
+                ApplyCollectionFilter();
+                if (target == curCollection)
+                {
+                    if (patientCache.ContainsKey(target.Name + "|*") && patientsAll.Count > 0) TrySelectPendingPatient();
+                    else { var _ = LoadPatients(); }
+                }
+                else
+                {
+                    foreach (ListViewItem it in lvColl.Items)
+                        if (it.Tag == target) { it.Selected = true; it.Focused = true; it.EnsureVisible(); break; }
+                }
+                SetStatus("Found " + pid + " in " + string.Join(", ", colls) + ".");
+            }
+            catch (Exception ex) { SetStatus("Search failed: " + Util.Inner(ex), true); }
+            finally { btnFind.Enabled = true; }
+        }
+
+        void PickManifest()
+        {
+            using (var d = new OpenFileDialog())
+            {
+                d.Title = "Open a TCIA manifest";
+                d.Filter = "TCIA manifest (*.tcia)|*.tcia|All files (*.*)|*.*";
+                d.Multiselect = true;
+                d.InitialDirectory = Native.Downloads();
+                if (d.ShowDialog(this) == DialogResult.OK) foreach (var f in d.FileNames) LoadManifest(f);
+            }
+        }
+
+        async void LoadManifest(string path)
+        {
+            List<string> uids;
+            try { uids = Util.ParseManifest(File.ReadAllLines(path)); }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Couldn't read " + Path.GetFileName(path) + ":\n\n" + ex.Message, "Open manifest", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            string name = Path.GetFileName(path);
+            if (uids.Count == 0)
+            {
+                MessageBox.Show(this, "No series were found in " + name + ".\n\nMake sure it's a .tcia manifest downloaded from the TCIA website.",
+                    "Open manifest", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            int done = 0, added = 0, missing = 0;
+            SetStatus("Reading manifest " + name + ": 0 of " + uids.Count + " series…");
+            var sem = new SemaphoreSlim(8);
+            var tasks = uids.Select(async uid =>
+            {
+                await sem.WaitAsync();
+                SeriesInfo s = null;
+                try
+                {
+                    var rows = await Tcia.GetList("getSeries?SeriesInstanceUID=" + Esc(uid), CancellationToken.None);
+                    if (rows.Count > 0) s = SeriesInfo.From(rows[0]);
+                }
+                catch (Exception) { }
+                finally { sem.Release(); }
+                if (s == null || s.SeriesUID == "")
+                {
+                    s = new SeriesInfo();
+                    s.SeriesUID = uid;
+                    s.Collection = "From manifest " + Path.GetFileNameWithoutExtension(name);
+                    s.PatientID = "Unknown patient";
+                    missing++;
+                }
+                added += Enqueue(new[] { s });
+                done++;
+                if (done % 5 == 0 || done == uids.Count) SetStatus("Reading manifest " + name + ": " + done + " of " + uids.Count + " series…");
+            }).ToList();
+            await Task.WhenAll(tasks);
+            SetStatus("Manifest " + name + ": added " + added + " series to Downloads" +
+                (missing > 0 ? " (" + missing + " weren't found in the public archive)" : "") + ".", missing > 0);
+        }
+
+        // ============================================================ folders
+
+        void ChangeFolder()
+        {
+            string picked = FolderPicker.Pick(this, "Choose where to save DICOM files", Directory.Exists(saveRoot) ? saveRoot : Native.Downloads());
+            if (string.IsNullOrEmpty(picked)) return;
+            saveRoot = picked;
+            SaveSettings();
+            UpdateSavePathLabel();
+            if (curSeries.Count > 0) FillSeries();
+            SetStatus("New downloads will be saved to " + saveRoot);
+        }
+
+        void OpenFolder(string path)
+        {
+            try
+            {
+                string p = path;
+                if (p == saveRoot) Directory.CreateDirectory(p);
+                while (!string.IsNullOrEmpty(p) && !Directory.Exists(p)) p = Path.GetDirectoryName(p);
+                if (string.IsNullOrEmpty(p)) return;
+                Process.Start("explorer.exe", "\"" + p + "\"");
+            }
+            catch (Exception ex) { SetStatus("Couldn't open the folder: " + ex.Message, true); }
+        }
+
+        // ============================================================ download queue
+
+        int Enqueue(IEnumerable<SeriesInfo> items)
+        {
+            int added = 0;
+            lvQueue.BeginUpdate();
+            try
+            {
+                foreach (var s in items)
+                {
+                    if (s == null || s.SeriesUID == "") continue;
+                    QueueItem existing;
+                    if (byUid.TryGetValue(s.SeriesUID, out existing))
+                    {
+                        if (existing.State == QState.Failed || existing.State == QState.Canceled)
+                        {
+                            existing.Status = "Waiting"; existing.Seen = false; existing.State = QState.Pending; added++;
+                        }
+                        continue;
+                    }
+                    var q = new QueueItem();
+                    q.S = s;
+                    q.Root = saveRoot;
+                    q.CollectionDir = Downloader.CollectionDir(saveRoot, s);
+                    q.Folder = Downloader.SeriesFolder(saveRoot, s);
+                    q.Item = new ListViewItem(new string[] {
+                        s.PatientID, s.Modality, Util.SeriesLabel(s), s.ImageCount > 0 ? s.ImageCount.ToString("N0") : "",
+                        Util.Size(s.FileSize), "Waiting", q.Folder });
+                    q.Item.Tag = q;
+                    lock (qlock) queue.Add(q);
+                    byUid[s.SeriesUID] = q;
+                    lvQueue.Items.Add(q.Item);
+                    added++;
+                }
+            }
+            finally { lvQueue.EndUpdate(); }
+            if (added > 0) { PumpQueue(); UiTick(); }
+            return added;
+        }
+
+        void PumpQueue()
+        {
+            int pending;
+            lock (qlock) pending = queue.Count(x => x.State == QState.Pending);
+            var token = runCts.Token;
+            while (activeWorkers < MaxWorkers && pending > 0)
+            {
+                activeWorkers++;
+                pending--;
+                Task.Run(() => WorkerLoop(token)).ContinueWith(t => { activeWorkers--; PumpQueue(); },
+                    TaskScheduler.FromCurrentSynchronizationContext());
+            }
+        }
+
+        async Task WorkerLoop(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                QueueItem q = null;
+                lock (qlock)
+                {
+                    foreach (var x in queue) if (x.State == QState.Pending) { q = x; break; }
+                    if (q != null) q.State = QState.Active;
+                }
+                if (q == null) return;
+                using (var itemCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                {
+                    q.Cts = itemCts;
+                    try { await Downloader.DownloadOne(q, itemCts.Token); }
+                    catch (OperationCanceledException) { q.Status = "Canceled"; q.State = QState.Canceled; }
+                    catch (Exception ex) { q.Status = "Failed: " + Util.Inner(ex); q.State = QState.Failed; }
+                    finally { q.Cts = null; }
+                }
+            }
+        }
+
+        void UiTick()
+        {
+            QueueItem[] items;
+            lock (qlock) items = queue.ToArray();
+            double ratio = Downloader.ZipRatio;
+            long total = 0;
+            double done = 0;
+            int nAct = 0, nPend = 0, nDone = 0, nSkip = 0, nFail = 0, nCanc = 0;
+            foreach (var q in items)
+            {
+                long fs = Math.Max(1, q.S.FileSize);
+                string st;
+                Color col;
+                switch (q.State)
+                {
+                    case QState.Pending:
+                        nPend++; total += fs; st = "Waiting"; col = cText; break;
+                    case QState.Active:
+                        {
+                            nAct++; total += fs;
+                            long rec = Interlocked.Read(ref q.Received);
+                            string status = q.Status;
+                            double frac = status == Downloader.StUnpacking ? 0.99 : Math.Min(0.97, rec / Math.Max(1.0, q.S.FileSize * ratio));
+                            done += fs * frac;
+                            st = status == Downloader.StDownloading
+                                ? "Downloading " + (q.S.FileSize > 0 ? (int)(frac * 100) + "%  ·  " : "") + Util.Size(rec)
+                                : status;
+                            col = cAccentText;
+                            break;
+                        }
+                    case QState.Done:
+                        nDone++; total += fs; done += fs; st = q.Status; col = cGreen; break;
+                    case QState.Skipped:
+                        nSkip++; total += fs; done += fs; st = q.Status; col = cGreen; break;
+                    case QState.Failed:
+                        nFail++; total += fs; done += fs; st = q.Status; col = cRed; break;
+                    default:
+                        nCanc++; st = "Canceled"; col = cMuted; break;
+                }
+                if (st != q.Shown) { q.Item.SubItems[5].Text = st; q.Shown = st; }
+                if (q.Item.ForeColor != col) q.Item.ForeColor = col;
+
+                bool final = q.State == QState.Done || q.State == QState.Skipped || q.State == QState.Failed || q.State == QState.Canceled;
+                if (final && !q.Seen)
+                {
+                    q.Seen = true;
+                    ListViewItem row;
+                    if (seriesRows.TryGetValue(q.S.SeriesUID, out row) && row.ListView != null)
+                    {
+                        bool ok = q.State == QState.Done || q.State == QState.Skipped;
+                        row.SubItems[5].Text = ok ? StSaved : q.State == QState.Failed ? "Failed" : "";
+                        row.ForeColor = ok ? cGreen : q.State == QState.Failed ? cRed : cText;
+                        UpdateSeriesSummary();
+                    }
+                }
+            }
+
+            var now = DateTime.UtcNow;
+            double dt = (now - lastTick).TotalSeconds;
+            long recv = Interlocked.Read(ref Downloader.TotalReceived);
+            if (dt >= 0.3)
+            {
+                double inst = (recv - lastRecv) / dt;
+                speed = speed <= 0 ? inst : speed * 0.75 + inst * 0.25;
+                lastRecv = recv; lastTick = now;
+            }
+
+            bool busy = nAct + nPend > 0;
+            double frac2 = total > 0 ? done / total : 0;
+            bar.Value = items.Length - nCanc > 0 ? frac2 : 0;
+            if (busy)
+            {
+                string eta = "";
+                if (speed > 20 * 1024)
+                {
+                    string d = Util.Duration(Math.Max(0, total - done) * ratio / speed);
+                    if (d != "") eta = "  ·  about " + d + " left";
+                }
+                lblQueueStatus.Text = (nDone + nSkip + nFail) + " of " + (items.Length - nCanc) + " series finished  ·  " +
+                    (speed >= 1024 ? Util.Size((long)speed) + "/s" : "starting…") + eta;
+                lblQueueStatus.ForeColor = cAccentText;
+            }
+            else if (items.Length > 0)
+            {
+                lblQueueStatus.Text = "Finished: " + nDone + " downloaded" +
+                    (nSkip > 0 ? ", " + nSkip + " already on your computer" : "") +
+                    (nFail > 0 ? ", " + nFail + " failed (click Retry failed)" : "") +
+                    (nCanc > 0 ? ", " + nCanc + " canceled" : "");
+                lblQueueStatus.ForeColor = nFail > 0 ? cRed : cGreen;
+            }
+            else
+            {
+                lblQueueStatus.Text = "Nothing queued yet. Tick the series you want above and click Download.";
+                lblQueueStatus.ForeColor = cMuted;
+            }
+
+            btnCancelAll.Enabled = busy;
+            btnRetry.Enabled = nFail + nCanc > 0;
+            btnClear.Enabled = nDone + nSkip + nCanc + nFail > 0;
+
+            if (taskbar != null)
+            {
+                try
+                {
+                    if (busy) { taskbar.SetProgressState(Handle, 2); taskbar.SetProgressValue(Handle, (ulong)(frac2 * 1000), 1000); }
+                    else taskbar.SetProgressState(Handle, 0);
+                }
+                catch (Exception) { taskbar = null; }
+            }
+            if (busy != sleepBlocked)
+            {
+                Native.SetThreadExecutionState(busy ? 0x80000001u : 0x80000000u);   // keep the PC awake while downloading
+                sleepBlocked = busy;
+            }
+            if (wasBusy && !busy)
+            {
+                foreach (var root in items.Select(q => q.Root).Distinct())
+                {
+                    string part = Path.Combine(root, ".partial");
+                    try { if (Directory.Exists(part) && !Directory.EnumerateFileSystemEntries(part).Any()) Directory.Delete(part); } catch (Exception) { }
+                }
+                if (Form.ActiveForm != this) Native.Flash(Handle);
+                SetStatus("Downloads finished. Your DICOM files are in " + saveRoot, nFail > 0);
+            }
+            wasBusy = busy;
+        }
+
+        List<QueueItem> SelectedQueueItems()
+        {
+            return lvQueue.SelectedItems.Cast<ListViewItem>().Select(i => (QueueItem)i.Tag).ToList();
+        }
+
+        void BuildQueueMenu()
+        {
+            var cm = new ContextMenuStrip();
+            var miOpen = new ToolStripMenuItem("Open folder");
+            miOpen.Click += (s, e) => { var l = SelectedQueueItems(); if (l.Count > 0) OpenFolder(l[0].Folder); };
+            var miRetry = new ToolStripMenuItem("Retry");
+            miRetry.Click += (s, e) => RetryItems(SelectedQueueItems());
+            var miCancel = new ToolStripMenuItem("Cancel");
+            miCancel.Click += (s, e) => CancelItems(SelectedQueueItems());
+            var miRemove = new ToolStripMenuItem("Remove from list");
+            miRemove.Click += (s, e) => RemoveItems(SelectedQueueItems());
+            var miCopy = new ToolStripMenuItem("Copy series UID");
+            miCopy.Click += (s, e) =>
+            {
+                var l = SelectedQueueItems();
+                if (l.Count > 0) Clipboard.SetText(string.Join("\r\n", l.Select(q => q.S.SeriesUID)));
+            };
+            cm.Items.AddRange(new ToolStripItem[] { miOpen, miRetry, miCancel, miRemove, new ToolStripSeparator(), miCopy });
+            cm.Opening += (s, e) =>
+            {
+                var l = SelectedQueueItems();
+                if (l.Count == 0) { e.Cancel = true; return; }
+                miRetry.Enabled = l.Any(q => q.State == QState.Failed || q.State == QState.Canceled);
+                miCancel.Enabled = l.Any(q => q.State == QState.Pending || q.State == QState.Active);
+                miRemove.Enabled = l.Any(q => q.State != QState.Active);
+            };
+            lvQueue.ContextMenuStrip = cm;
+        }
+
+        void RetryItems(List<QueueItem> list)
+        {
+            if (list == null) lock (qlock) list = queue.ToList();
+            foreach (var q in list)
+                if (q.State == QState.Failed || q.State == QState.Canceled)
+                {
+                    q.Status = "Waiting"; q.Seen = false;
+                    Interlocked.Exchange(ref q.Received, 0);
+                    q.State = QState.Pending;
+                }
+            PumpQueue();
+            UiTick();
+        }
+
+        void CancelItems(List<QueueItem> list)
+        {
+            foreach (var q in list)
+            {
+                lock (qlock) if (q.State == QState.Pending) { q.Status = "Canceled"; q.State = QState.Canceled; continue; }
+                var cts = q.Cts;
+                if (q.State == QState.Active && cts != null) { try { cts.Cancel(); } catch (ObjectDisposedException) { } }
+            }
+            UiTick();
+        }
+
+        void RemoveItems(List<QueueItem> list)
+        {
+            lvQueue.BeginUpdate();
+            try
+            {
+                foreach (var q in list)
+                {
+                    lock (qlock)
+                    {
+                        if (q.State == QState.Active) continue;
+                        queue.Remove(q);
+                    }
+                    byUid.Remove(q.S.SeriesUID);
+                    lvQueue.Items.Remove(q.Item);
+                }
+            }
+            finally { lvQueue.EndUpdate(); }
+            UiTick();
+        }
+
+        void ClearFinished()
+        {
+            List<QueueItem> fin;
+            lock (qlock) fin = queue.Where(q => q.State == QState.Done || q.State == QState.Skipped || q.State == QState.Canceled || q.State == QState.Failed).ToList();
+            RemoveItems(fin);
+        }
+
+        void CancelAll(bool ask)
+        {
+            bool busy;
+            lock (qlock) busy = queue.Any(q => q.State == QState.Active || q.State == QState.Pending);
+            if (!busy) return;
+            if (ask && MessageBox.Show(this, "Stop all downloads?\n\nSeries that already finished stay on your computer.", "Cancel downloads",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            lock (qlock) foreach (var q in queue) if (q.State == QState.Pending) { q.Status = "Canceled"; q.State = QState.Canceled; }
+            runCts.Cancel();
+            runCts = new CancellationTokenSource();
+            UiTick();
+        }
+    }
+
+    // ------------------------------------------------------------------ command-line self test (no window)
+
+    static class SelfTest
+    {
+        public static async Task<int> Run(string outDir)
+        {
+            var log = new StringBuilder();
+            Action<string> W = m => log.AppendLine(DateTime.Now.ToString("HH:mm:ss ") + m);
+            int rc = 0;
+            try
+            {
+                Directory.CreateDirectory(outDir);
+                var sw = Stopwatch.StartNew();
+                var cols = await Tcia.GetList("getCollectionValues", CancellationToken.None);
+                W("collections: " + cols.Count + " (" + sw.ElapsedMilliseconds + " ms)");
+                sw.Restart();
+                var web = await Tcia.GetWebCollections(CancellationToken.None);
+                W("website records: " + web.Count + " (" + sw.ElapsedMilliseconds + " ms)");
+                var nsclc = web.FirstOrDefault(r => Util.Norm(J.S(r, "collection_short_title")) == "nsclcradiomics");
+                W("NSCLC-Radiomics on website: types=" + J.S(nsclc, "cancer_types") + " | subjects=" + J.S(nsclc, "subjects"));
+                var mods = await Tcia.GetList("getModalityValues?Collection=NSCLC-Radiomics", CancellationToken.None);
+                W("NSCLC-Radiomics modalities: " + string.Join(", ", mods.Select(r => J.S(r, "Modality"))));
+                var pats = await Tcia.GetList("getPatient?Collection=NSCLC-Radiomics", CancellationToken.None);
+                W("NSCLC-Radiomics patients: " + pats.Count);
+                var series = (await Tcia.GetList("getSeries?Collection=NSCLC-Radiomics&PatientID=LUNG1-001", CancellationToken.None))
+                    .Select(SeriesInfo.From).ToList();
+                series.Sort(SeriesInfo.Compare);
+                W("LUNG1-001 series: " + string.Join(" | ", series.Select(s => s.Modality + " #" + s.SeriesNumber + " " + s.ImageCount + " img " + Util.Size(s.FileSize))));
+
+                foreach (var s in series.Where(x => x.Modality == "RTSTRUCT" || x.Modality == "SEG"))
+                {
+                    var q = new QueueItem();
+                    q.S = s; q.Root = outDir;
+                    q.CollectionDir = Downloader.CollectionDir(outDir, s);
+                    q.Folder = Downloader.SeriesFolder(outDir, s);
+                    sw.Restart();
+                    await Downloader.DownloadOne(q, CancellationToken.None);
+                    W("download " + s.Modality + ": " + q.State + " / " + q.Status + " / zip " + Util.Size(q.ZipBytes) + " in " + sw.ElapsedMilliseconds + " ms");
+                    W("  -> " + q.Folder);
+                    W("  files: " + string.Join(", ", Directory.GetFiles(q.Folder).Select(Path.GetFileName)));
+                    var q2 = new QueueItem();
+                    q2.S = s; q2.Root = outDir; q2.CollectionDir = q.CollectionDir; q2.Folder = q.Folder;
+                    await Downloader.DownloadOne(q2, CancellationToken.None);
+                    W("  second attempt: " + q2.State + " / " + q2.Status);
+                }
+                W("learned zip ratio: " + Downloader.ZipRatio.ToString("0.00"));
+                W("license present: " + File.Exists(Path.Combine(Downloader.CollectionDir(outDir, series[0]), "LICENSE.txt")));
+                W("partial folder left behind: " + (Directory.Exists(Path.Combine(outDir, ".partial")) && Directory.GetFiles(Path.Combine(outDir, ".partial")).Length > 0));
+
+                var manifest = new[] {
+                    "downloadServerUrl=https://nbia.cancerimagingarchive.net/nbia-download/servlet/DownloadServlet",
+                    "includeAnnotation=true", "noOfrRetry=4", "databasketId=manifest-123.tcia", "manifestVersion=3.0",
+                    "ListOfSeriesToDownload=", series[0].SeriesUID, series[1].SeriesUID, "" };
+                var parsed = Util.ParseManifest(manifest);
+                W("manifest parse: " + parsed.Count + " series (expected 2)");
+                var meta = await Tcia.GetList("getSeries?SeriesInstanceUID=" + Uri.EscapeDataString(parsed[0]), CancellationToken.None);
+                W("manifest lookup: " + (meta.Count > 0 ? SeriesInfo.From(meta[0]).PatientID + " " + SeriesInfo.From(meta[0]).Modality : "not found"));
+                var find = await Tcia.GetList("getSeries?PatientID=PANCREAS_0001", CancellationToken.None);
+                W("find PANCREAS_0001: " + string.Join(", ", find.Select(r => J.S(r, "Collection")).Distinct()));
+                W("downloads folder: " + Native.Downloads());
+            }
+            catch (Exception ex) { W("ERROR " + ex); rc = 1; }
+            File.WriteAllText(Path.Combine(outDir, "selftest.log"), log.ToString());
+            return rc;
+        }
+    }
+}
